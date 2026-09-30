@@ -48,6 +48,26 @@ System Settings > Privacy & Security > Screen & System Audio Recording
 
 macOS 버전에 따라 항목 이름이 다를 수 있다. 권한을 부여한 뒤 해당 프로세스를 다시 실행한다. 마이크 권한은 필요하지 않다.
 
+## 에이전트용 도움말과 스킬
+
+```bash
+rec -h                  # 짧은 명령 목록
+rec --help              # 전체 작업 흐름, 세션·출력·종료 코드 계약
+rec start --help        # 대상 선택, 오디오 범위, 실패 처리
+rec test --help         # argv 경계, 타임아웃, 실패 후 종료 예제
+rec help stop           # stop --help와 같은 상세 도움말
+```
+
+각 명령의 `--help`에는 사전 조건, 상태 변화, 사용 예제와 오류 후 처리 지침을 포함한다.
+도움말과 버전 확인은 녹화를 시작하거나 세션을 변경하지 않으며 화면 권한·미디어 도구가 필요 없다.
+`rec test PROGRAM --help`는 녹화기 help가 아니라 **자식 프로그램을 실행하는 명령**이다.
+
+[`agent-work-recorder` 스킬](skills/agent-work-recorder/SKILL.md)은 명령 선택부터
+녹화 범위·Run 소유권, 기대와 관찰의 구분, 실패한 테스트 뒤의 종료, 실제 영상 확인,
+스크린샷 피드백을 새 Run에 연결하는 절차까지 제공한다.
+[스킬 설치와 구성](skills/README.md)을 참고한다. `make install`은 CLI만 설치하며,
+스킬을 읽는 것 자체가 녹화나 외부 업로드의 승인은 아니다.
+
 ## 한 번의 작업 기록
 
 ```bash

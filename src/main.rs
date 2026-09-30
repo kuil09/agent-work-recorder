@@ -12,42 +12,81 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod help;
+
 #[derive(Parser, Debug)]
-#[command(name = "rec", about = "Record agent work and claims as a reviewable MP4", version)]
+#[command(
+    name = "rec",
+    about = "Record agent work and claims as a reviewable MP4",
+    long_about = help::OVERVIEW,
+    after_help = "Use rec <COMMAND> --help for contracts, examples and failure handling.",
+    after_long_help = help::OVERVIEW_DETAILS,
+    version
+)]
 struct Cli { #[command(subcommand)] command: Commands }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Start one local recording run
+    #[command(long_about = help::START, after_long_help = help::START_DETAILS)]
     Start {
-        #[arg(long)] title: Option<String>,
+        #[arg(long, value_name = "TEXT", help = "Title for the Run, initial context and MP4 metadata",
+            long_help = "Human-readable purpose of this Run. Used in initial context, MP4 title and the default filename slug. Quote spaces. Does not select a capture target or execute a task.")]
+        title: Option<String>,
         #[command(flatten)] capture: CaptureOptions,
-        #[arg(long)] output: Option<PathBuf>,
+        #[arg(long, value_name = "FILE.mp4", help = "Final MP4 path; must not already exist",
+            long_help = "Final output must end in .mp4. Relative paths are resolved from rec start's working directory. Defaults to ./recordings/<RUNID>-<title-slug>.mp4, or <RUNID>.mp4 without a title. Existing files are never overwritten; stop publishes the final file.")]
+        output: Option<PathBuf>,
     },
     /// Record current action/context
-    Note { #[arg(required = true)] text: Vec<String> },
+    #[command(long_about = help::NOTE, after_long_help = help::NOTE_DETAILS)]
+    Note { #[arg(required = true, value_name = "TEXT", help = "Nonblank action/context; quote as one short statement")] text: Vec<String> },
     /// Record expected results, not a verdict
-    Expect { #[arg(required = true)] text: Vec<String> },
+    #[command(long_about = help::EXPECT, after_long_help = help::EXPECT_DETAILS)]
+    Expect { #[arg(required = true, value_name = "TEXT", help = "Observable acceptance criterion, written before the check")] text: Vec<String> },
     /// Record an agent observation/claim
-    Observe { #[arg(long, value_enum)] status: Option<StatusArg>, #[arg(required = true)] text: Vec<String> },
+    #[command(long_about = help::OBSERVE, after_long_help = help::OBSERVE_DETAILS)]
+    Observe {
+        #[arg(long, value_enum, value_name = "VERDICT", help = "Agent claim: pass, fail, uncertain or info (default: info)",
+            long_help = "Agent's claimed verdict, not a recorder assertion. Omission behaves as info and clears any previous verdict. Use uncertain when evidence is insufficient; never infer pass solely from a command's exit code.")]
+        status: Option<StatusArg>,
+        #[arg(required = true, value_name = "TEXT", help = "What was actually observed, including evidence or uncertainty")]
+        text: Vec<String>,
+    },
     /// Create a review checkpoint and MP4 chapter boundary
-    Checkpoint { #[arg(required = true)] text: Vec<String> },
+    #[command(long_about = help::CHECKPOINT, after_long_help = help::CHECKPOINT_DETAILS)]
+    Checkpoint { #[arg(required = true, value_name = "TEXT", help = "Scene label for human review and the MP4 chapter")] text: Vec<String> },
     /// Run a noninteractive command; preserve its exit code, never infer PASS
+    #[command(long_about = help::TEST, after_long_help = help::TEST_DETAILS)]
     Test {
         /// Terminate the test process group after this many seconds
-        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
+        #[arg(long, value_name = "SECONDS", default_value_t = 300,
+            long_help = "Positive timeout in seconds. Put this option before COMMAND. On timeout the test process group is terminated and the wrapper returns 124; the recording stays active and still needs stop.",
+            value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: u64,
-        #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(required = true, value_name = "COMMAND", num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true,
+            help = "Executable followed by its arguments; no implicit shell",
+            long_help = "Executable plus argv, forwarded without an implicit shell. Uses this caller's cwd/environment with closed stdin. Tokens after the executable belong to the child. Use rec test --help for recorder help, or rec test -- PROGRAM --help to run the program's help.")]
         command: Vec<String>,
     },
     /// Finalize a validated MP4 with chapters and optional audio
+    #[command(long_about = help::STOP, after_long_help = help::STOP_DETAILS)]
     Stop,
     #[command(hide = true)]
     Daemon { #[arg(long)] config: PathBuf },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
-enum StatusArg { Pass, Fail, Uncertain, Info }
+enum StatusArg {
+    /// Agent claims the observed result matches the stated criterion
+    Pass,
+    /// Agent claims the observed result does not match the criterion
+    Fail,
+    /// Available evidence does not justify a pass/fail claim
+    Uncertain,
+    /// Observation without a verdict; clears the previous verdict
+    Info,
+}
 impl From<StatusArg> for ObserveStatus {
     fn from(value: StatusArg) -> Self {
         match value { StatusArg::Pass => Self::Pass, StatusArg::Fail => Self::Fail, StatusArg::Uncertain => Self::Uncertain, StatusArg::Info => Self::Info }
@@ -178,5 +217,44 @@ mod tests {
         let cli = Cli::try_parse_from(["rec", "start", "--app", "com.apple.Safari", "--system-audio"]).unwrap();
         if let Commands::Start { capture, .. } = cli.command { assert!(capture.system_audio); assert!(capture.validate().is_ok()); } else { panic!("expected start"); }
         assert!(Cli::try_parse_from(["rec", "start", "--app", "Safari", "--window-id", "1"]).is_err());
+    }
+
+    #[test]
+    fn help_contract_builds_and_examples_parse_without_execution() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        for input in [
+            vec!["rec", "start", "--title", "Login review", "--app", "com.apple.Safari"],
+            vec!["rec", "start", "--window", "Login - Google Chrome", "--output", "./review.mp4"],
+            vec!["rec", "start", "--window-id", "12345"],
+            vec!["rec", "start", "--screen", "full", "--system-audio"],
+            vec!["rec", "note", "--", "--compact is being investigated"],
+            vec!["rec", "expect", "로그인 실패 시 오류가 표시된다."],
+            vec!["rec", "observe", "--status", "uncertain", "Result unconfirmed"],
+            vec!["rec", "checkpoint", "Final review scene"],
+            vec!["rec", "test", "--", "sh", "-c", "printf 'diagnostic\\n'; exit 7"],
+            vec!["rec", "stop"],
+        ] {
+            Cli::try_parse_from(&input).unwrap_or_else(|e| panic!("{input:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_help_and_child_help_have_distinct_argv_boundaries() {
+        use clap::error::ErrorKind;
+        assert_eq!(Cli::try_parse_from(["rec", "test", "--help"]).unwrap_err().kind(), ErrorKind::DisplayHelp);
+        for input in [
+            vec!["rec", "test", "--timeout-secs", "60", "--", "npm", "--help", "--timeout-secs", "1"],
+            vec!["rec", "test", "--timeout-secs", "60", "npm", "--help", "--timeout-secs", "1"],
+        ] {
+            let cli = Cli::try_parse_from(input).unwrap();
+            match cli.command {
+                Commands::Test { timeout_secs, command } => {
+                    assert_eq!(timeout_secs, 60);
+                    assert_eq!(command, ["npm", "--help", "--timeout-secs", "1"]);
+                }
+                _ => panic!("expected test"),
+            }
+        }
     }
 }

@@ -16,19 +16,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Default, clap::Args, Serialize, Deserialize)]
 pub struct CaptureOptions {
-    /// Capture the main display (only `full` is supported)
-    #[arg(long, conflicts_with_all = ["window", "window_id", "app"]) ]
+    /// Capture the main display (only full is supported)
+    #[arg(long, value_name = "full", conflicts_with_all = ["window", "window_id", "app"],
+        long_help = "Record the entire main display. Only full is accepted; not a numeric display ID or all monitors. This is also the default when no target is supplied. May expose unrelated apps and notifications. Prefer an explicit window or app.")]
     pub screen: Option<String>,
-    /// Window title/application substring; prefer --window-id when ambiguous
-    #[arg(long, conflicts_with_all = ["screen", "window_id", "app"]) ]
+    /// Find a window by title or application substring
+    #[arg(long, value_name = "QUERY", conflicts_with_all = ["screen", "window_id", "app"],
+        long_help = "Case-insensitive substring match on window title or owning app. A unique exact title can disambiguate; otherwise multiple matches fail. Use rec-capture list-windows and --window-id to select explicitly. Never falls back to full-display screenshots.")]
     pub window: Option<String>,
-    #[arg(long, conflicts_with_all = ["screen", "window", "app"]) ]
+    /// Capture one discovered window by its current numeric ID
+    #[arg(long, value_name = "ID", conflicts_with_all = ["screen", "window", "app"],
+        long_help = "Current numeric window ID from rec-capture list-windows. IDs may change when a window closes or an app restarts. A missing target fails instead of widening scope. This selects video only; optional audio remains app-scoped.")]
     pub window_id: Option<u32>,
-    /// Exact application name or bundle ID; its windows on the main display
-    #[arg(long, conflicts_with_all = ["screen", "window", "window_id"]) ]
+    /// Capture one application's windows on the main display
+    #[arg(long, value_name = "NAME_OR_BUNDLE_ID", conflicts_with_all = ["screen", "window", "window_id"],
+        long_help = "Exact running application name or bundle ID, such as com.apple.Safari. Includes that application's windows on the main display only; not all monitors or an arbitrary set of apps. Discover with rec-capture list-apps. No automatic reconnection after app restart or wider fallback.")]
     pub app: Option<String>,
-    /// Opt in to system/app audio; NEVER records the microphone
-    #[arg(long)]
+    /// Opt in to system/app audio (default OFF; never microphone)
+    #[arg(long,
+        long_help = "Explicitly enable 48 kHz stereo AAC. Default OFF. Full-display video uses system audio; app/window video uses owning-app audio. A single-window recording can therefore include sound from the same app's OTHER windows. Never captures microphone input. Missing requested audio is an error, not silent success.")]
     pub system_audio: bool,
 }
 impl CaptureOptions {
