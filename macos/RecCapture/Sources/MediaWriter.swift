@@ -98,6 +98,11 @@ final class MediaWriter {
         for row in 0..<h { memcpy(to.advanced(by: row * targetStride), from.advanced(by: row * sourceStride), min(sourceStride, targetStride)) }
         guard let context = CGContext(data: to, width: w, height: h, bitsPerComponent: 8, bytesPerRow: targetStride,
             space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
+        // NSGraphicsContext's `flipped` flag informs AppKit text layout but does
+        // not change the CGContext transform. Convert the drawing coordinates
+        // explicitly; the already-copied source pixels retain their orientation.
+        context.translateBy(x: 0, y: CGFloat(h))
+        context.scaleBy(x: 1, y: -1)
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
         drawOverlay(size: NSSize(width: w, height: h), state: overlay.snapshot())
