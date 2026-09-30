@@ -1,6 +1,6 @@
 //! MP4 finalization. Never report success after silently dropping audio or chapters.
 use crate::protocol::{EventKind, RunEvent};
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -45,12 +45,15 @@ pub fn escape(value: &str) -> String {
 
 pub fn metadata(title: Option<&str>, run_id: &str, commit: Option<&str>, created_at: &str, chapters: &[Chapter]) -> String {
     let mut out = String::from(";FFMETADATA1\n");
-    if let Some(title) = title { out.push_str(&format!("title={}\n", escape(title))); }
+    if let Some(title) = title { out.push_str(&format!("title={}\n\n", escape(title))); }
     out.push_str(&format!("comment=runId={}\n", escape(run_id)));
     if let Some(commit) = commit { out.push_str(&format!("synopsis=git {}\n", escape(commit))); }
     if !created_at.is_empty() { out.push_str(&format!("creation_time={}\n", escape(created_at))); }
-    for c in chapters {
-        out.push_str(&format!("\n[CHAPTER]\nTIMEBASE=1/1000\nSTART={}\nEND={}\ntitle={}\n", c.start_ms, c.end_ms, escape(&c.title)));
+    // Only numeric boundaries go through the ffmetadata chapter parser. In FFmpeg,
+    // a doubled trailing backslash can still absorb the newline as a continuation.
+    // Exact user titles are supplied as separate argv metadata values in remux().
+    for (index, c) in chapters.iter().enumerate() {
+        out.push_str(&format!("\n[CHAPTER]\nTIMEBASE=1/1000\nSTART={}\nEND={}\ntitle=Chapter {}\n", c.start_ms, c.end_ms, index + 1));
     }
     out
 }
@@ -93,13 +96,16 @@ pub fn remux(raw: &Path, output: &Path, metadata_path: &Path, expected_chapters:
     ensure!(!output.exists(), "output already exists: {}", output.display());
     let name = output.file_name().context("output must be a file")?.to_string_lossy();
     let temp = output.with_file_name(format!(".{name}.{run_id}.partial.mp4"));
-    // Reserve the name before passing it to ffmpeg; never clobber an unrelated file.
     fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
     let result = (|| -> Result<()> {
-        let status = Command::new("ffmpeg").args(["-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i"]).arg(raw)
+        let mut command = Command::new("ffmpeg");
+        command.args(["-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i"]).arg(raw)
             .args(["-f", "ffmetadata", "-i"]).arg(metadata_path)
-            .args(["-map", "0:v:0", "-map", "0:a?", "-map_metadata", "1", "-map_chapters", "1", "-c", "copy", "-movflags", "+faststart"])
-            .arg(&temp).output().context("ffmpeg remux")?;
+            .args(["-map", "0:v:0", "-map", "0:a?", "-map_metadata", "1", "-map_chapters", "1", "-c", "copy", "-movflags", "+faststart"]);
+        for (index, chapter) in expected_chapters.iter().enumerate() {
+            command.arg(format!("-metadata:c:{index}")).arg(format!("title={}", chapter.title));
+        }
+        let status = command.arg(&temp).output().context("ffmpeg remux")?;
         ensure!(status.status.success(), "ffmpeg remux failed: {}", String::from_utf8_lossy(&status.stderr));
         let info = probe(&temp)?;
         validate(&info, audio)?;
@@ -110,10 +116,9 @@ pub fn remux(raw: &Path, output: &Path, metadata_path: &Path, expected_chapters:
             let end: f64 = a["end_time"].as_str().context("chapter end missing")?.parse()?;
             ensure!((start * 1000.0 - e.start_ms as f64).abs() <= 2.0 && (end * 1000.0 - e.end_ms as f64).abs() <= 2.0,
                 "chapter timestamps did not survive muxing");
-            ensure!(a["tags"]["title"].as_str() == Some(e.title.as_str()), "chapter title did not survive muxing");
+            ensure!(a["tags"]["title"].as_str() == Some(e.title.as_str()), "chapter title did not survive muxing: expected {:?}, got {:?}", e.title, a["tags"]["title"]);
         }
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
-        // An atomic, no-overwrite publication on the same filesystem.
         fs::hard_link(&temp, output).context("publish MP4 without overwriting an existing file")?;
         Ok(())
     })();
@@ -124,7 +129,6 @@ pub fn remux(raw: &Path, output: &Path, metadata_path: &Path, expected_chapters:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::RunEvent;
     fn event(kind: EventKind, ms: u64) -> RunEvent {
         RunEvent { ts_ms: 0, media_ms: ms, step: 1, step_id: "7F32:001".into(), kind, text: "한글 # = ; \\".into(), status: None, test_result: None }
     }
@@ -161,6 +165,7 @@ mod tests {
         let p = probe(&output).unwrap(); validate(&p, true).unwrap();
         assert_eq!(p["format"]["tags"]["title"], "한글 # =");
         assert_eq!(p["chapters"].as_array().unwrap().len(), 2);
+        assert!(p["chapters"][1]["tags"]["title"].as_str().unwrap().ends_with('\\'));
         fs::remove_dir_all(dir).unwrap();
     }
 }
