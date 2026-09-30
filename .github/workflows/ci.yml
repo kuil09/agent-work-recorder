@@ -32,6 +32,8 @@ jobs:
         run: swift test --package-path macos/RecCapture
       - name: Swift capture helper release build
         run: swift build -c release --package-path macos/RecCapture
+      - name: Capture helper supervision and diagnostics (no live capture)
+        run: python3 tests/check_capture_supervisor.py
       - name: Native synthetic H.264 and AAC encoding (no TCC access)
         run: |
           mkdir -p artifacts
