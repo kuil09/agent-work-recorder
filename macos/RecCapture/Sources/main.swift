@@ -13,18 +13,15 @@ func emit(_ object: [String: Any]) {
     fputs(line + "\n", stdout); fflush(stdout)
 }
 func ensurePermission() throws {
-    if CGPreflightScreenCaptureAccess() { return }
-    CGRequestScreenCaptureAccess()
-    guard CGPreflightScreenCaptureAccess() else {
-        throw RecorderError("Screen Recording permission is required.\nSystem Settings > Privacy & Security > Screen & System Audio Recording\nGrant access to the invoking terminal/agent and relaunch it.")
-    }
+    try CaptureEnvironment.requireScreenAccess(requestPermission: true)
+    try CaptureEnvironment.prepareGUI()
 }
 func fetchContent() throws -> SCShareableContent {
     let done = DispatchSemaphore(value: 0)
     var result: Result<SCShareableContent, Error>?
     SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
         if let content { result = .success(content) }
-        else { result = .failure(error ?? RecorderError("no shareable content")) }
+        else { result = .failure(CaptureEnvironment.classify(error ?? RecorderError("no shareable content"))) }
         done.signal()
     }
     guard done.wait(timeout: .now() + 8) == .success, let result else { throw RecorderError("shareable content discovery timed out") }
@@ -102,7 +99,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         let filter: SCContentFilter
         if let id = args.windowId {
             guard let window = content.windows.first(where: { $0.windowID == id }) else { throw RecorderError("window \(id) not found") }
-            filter = SCContentFilter(desktopIndependentWindow: window)
+            filter = try CaptureEnvironment.windowFilter(window)
         } else {
             let displayID: CGDirectDisplayID
             if args.display == nil || args.display == "main" { displayID = CGMainDisplayID() }
@@ -141,7 +138,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         let done = DispatchSemaphore(value: 0); var startError: Error?
         stream.startCapture { error in startError = error; done.signal() }
         guard done.wait(timeout: .now() + 8) == .success else { throw RecorderError("startCapture timed out") }
-        if let startError { throw startError }
+        if let startError { throw CaptureEnvironment.classify(startError) }
         emit(["event": "started", "width": width, "height": height, "system_audio": args.systemAudio])
     }
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -175,6 +172,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
             let now = CMClockGetTime(CMClockGetHostTimeClock())
             if try writer.appendVideo(pixel, at: now), !ready, let origin = writer.origin {
                 ready = true
+                CaptureWorkerLifetime.markReady()
                 let elapsed = max(0, CMTimeGetSeconds(CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), origin)) * 1000)
                 emit(["event": "ready", "elapsed_ms": Int(elapsed)])
             }
@@ -232,9 +230,39 @@ func stampFrame(_ args: Args) throws {
     try png.write(to: URL(fileURLWithPath: output))
 }
 
+let helperHelp = """
+Usage:
+  rec-capture start --output FILE [--app NAME|BUNDLE | --window-id ID | --display main] [--system-audio]
+  rec-capture list-windows | list-apps | list-displays
+  rec-capture diagnose [--window-id ID]
+
+Use an authorized interactive macOS desktop session for discovery AND recording.
+A sandbox/TCC-attribution restriction is not proof of missing Screen Recording permission.
+When only sandboxed execution fails, use the host's approved outside-sandbox invocation;
+this helper does not bypass restrictions or expand a window request to an app/display.
+
+Diagnose is read-only: no permission prompt, recording, output file or recorder session.
+It reports public preflight evidence, thread/AppKit state and advisory sandbox markers.
+With --window-id it also constructs that exact filter; it does not verify live recording.
+Native initialization runs in a same-executable worker; worker signals become exit 1
+with a structured diagnostic. A worker crash may still generate a macOS crash report.
+
+Other commands: stamp --input PNG --output PNG --state JSON; self-test --output MP4
+Synthetic self-test media is not live screen-capture or permission evidence.
+See docs/macos-capture-diagnostics.md for the minimal reproducer and acceptance checks.
+"""
+
 func main() throws {
-    guard CommandLine.arguments.count > 1 else { throw RecorderError("usage: rec-capture start --output FILE [--app NAME|BUNDLE | --window-id ID | --display main] [--system-audio]\n       rec-capture list-windows | list-apps | list-displays") }
-    let args = try Args.parse(Array(CommandLine.arguments.dropFirst()))
+    var values = Array(CommandLine.arguments.dropFirst())
+    if values == ["--help"] || values == ["-h"] { print(helperHelp); return }
+    guard !values.isEmpty else { throw RecorderError(helperHelp) }
+    let isWorker = values.first == CaptureSupervisor.workerCommand
+    if isWorker { values.removeFirst(); try CaptureWorkerLifetime.start() }
+    let args = try Args.parse(values)
+    if CaptureSupervisor.liveCommands.contains(args.command) && !isWorker {
+        exit(try CaptureSupervisor.run(values))
+    }
+    if args.command == "diagnose" { try diagnoseCapture(args); return }
     if ["list-windows", "list-apps", "list-displays"].contains(args.command) { try listContent(args.command); return }
     if args.command == "stamp" { try stampFrame(args); return }
     if args.command == "self-test" { try syntheticRecording(args); return }
@@ -252,4 +280,4 @@ func main() throws {
     }
     RunLoop.main.run()
 }
-do { try main() } catch { emit(["event": "error", "message": error.localizedDescription]); fputs(error.localizedDescription + "\n", stderr); exit(1) }
+do { try main() } catch { reportCaptureError(error); exit(1) }
