@@ -215,15 +215,54 @@ def main():
     finally:
         h.close()
 
-    for options in [('--app', 'com.example.Synthetic'), ('--system-audio',), ('--window-id', '123')]:
+    for options in [('--app', 'com.example.Synthetic'), ('--system-audio',), ('--window-id', '123'),
+                    ('--screen', 'full'), ()]:
         h = Harness(binary, 'fail-start')
         try:
             result = h.call('start', *options, code=1)
             assert 'refusing to expand scope or drop requested audio' in result.stderr
             assert not (h.home / '.agent-recorder/session').exists()
+            # A Run that never started must not leave args/temp directories behind.
+            leftovers = list((h.tmp / 'agent-recorder').iterdir())
+            assert not leftovers, leftovers
         finally:
             h.close()
     checks.append('app/window/audio capture never silently degrades to full-screen silent fallback')
+
+    h = Harness(binary)
+    try:
+        started = h.call('start', '--output', 'out.mp4', '--no-git-context')
+        assert 'not collected' in started.stdout
+        session = h.session()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stalled:
+            stalled.connect(session['socket'])  # connects but never sends a request
+            began = time.monotonic()
+            h.call('note', 'a stalled client must not block the recorder')
+            assert time.monotonic() - began < 3
+        status = h.call('status')
+        assert session['run_id'] in status.stdout and 'Steps      1' in status.stdout
+        h.call('test', '--', 'sh', '-c', 'echo DB_PASSWORD=hunter2')
+        masked = json.dumps(h.events()[-2:])
+        assert 'hunter2' not in masked and 'DB_PASSWORD=***' in masked
+        h.call('test', '--no-output-summary', '--', 'sh', '-c', 'echo plain-output')
+        last = h.events()[-1]['test_result']
+        assert last['stdout_summary'] == '' and last['stderr_summary'] == ''
+        checks.append('stalled clients, read-only status, secret masking and --no-output-summary')
+
+        # A test whose CLI is gone (or cannot be probed) must not block stop forever.
+        assert h.ipc({'op': 'test_begin', 'command': ['lost'], 'cwd': '/', 'owner_pid': os.getpid(),
+                      'timeout_secs': 300})['ok']
+        assert 'Test running' in h.call('status').stdout
+        h.call('stop', code=1)
+        (h.root / 'out.mp4').write_text('someone else created this during the run')
+        stop = h.call('stop', '--abandon-test')
+        assert 'Warning' in stop.stdout and 'already exists' in stop.stdout
+        assert (h.root / 'out.mp4').read_text().startswith('someone else')
+        assert (h.root / f"out-{session['run_id']}.mp4").is_file()
+        assert not (h.home / '.agent-recorder/session').exists()
+        checks.append('stop --abandon-test and output collision fallback without losing the recording')
+    finally:
+        h.close()
     (evidence / 'e2e-report.json').write_text(json.dumps({'passed': checks, 'capture': 'synthetic helper, not ScreenCaptureKit'}, indent=2))
     print(f'{len(checks)} end-to-end scenario groups passed (synthetic capture; real CLI/daemon/ffmpeg).')
 

@@ -18,7 +18,7 @@ application behavior. None automatically implies the others. Read stderr before 
 | `gui-session-unavailable` | Use the authorized logged-in console session; restrictions may hide session information | Treat this as proof of TCC denial or run sudo/launchctl to bypass host policy |
 | `native-capture-crashed` / `CGS_REQUIRE_INIT` | Preserve the last initialization stage; diagnose the same window ID and report the native failure | Broaden to the app/display without approval or claim the worker's abort was caught in-process |
 | rec-capture/ffmpeg/ffprobe missing | Correct the installation/PATH before capture | Install unrelated packages or substitute a fake capture helper |
-| A test is still running | Finish it or interrupt its owning process before stop | Start a second test or continually retry stop |
+| A test is still running | Finish it or interrupt its owning process before stop. If its `rec test` process is gone, `rec stop --abandon-test` records an unknown result (the daemon also does so after timeout + 30 s) | Start a second test or continually retry stop |
 | Child returns nonzero | Record the mechanical result and inspect the cause; still finalize your Run | Convert exit 0 into PASS or use `test && stop` |
 | Command finished but its result could not be recorded | Execution may already have happened; inspect recorder and child evidence separately | Automatically rerun a potentially side-effecting command |
 | CAPTURE TARGET LOST | Report lost evidence and stop your Run; a later attempt is a new Run | Treat the last frozen image as continued observation |
@@ -63,7 +63,9 @@ remain consistent across calls. Paths shown here are templates, not existing art
 Do not blindly remove session, lock, sockets or raw media. Successful stop removes Run
 temporary files; logs can remain. Failure does not guarantee that raw media is playable.
 
-A full-display/video-only Run can use an already available CuaDriver screenshot fallback.
+A full-display/video-only Run can use an already available CuaDriver screenshot fallback
+only when started with `--allow-screenshot-fallback` (default OFF, so native failures are
+reported). `rec status` and `rec stop` print a Warning when it was used.
 App, window and requested-audio capture cannot. A fallback is lower-frequency evidence;
 do not describe it as native continuous capture. `REC_CAPTURE` is a capture-helper override,
 not a way to bypass permissions or replace real evidence with a synthetic fixture.

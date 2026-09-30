@@ -49,7 +49,16 @@ enum Commands {
             long_help = "Final output must end in .mp4. Relative paths are resolved from rec start's working directory. Defaults to ./recordings/<RUNID>-<title-slug>.mp4, or <RUNID>.mp4 without a title. Existing files are never overwritten; stop publishes the final file."
         )]
         output: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Do not collect or display repository, branch, commit or tree state",
+            long_help = "Skip the start-time Git context entirely: it is not collected, shown in the video, printed, or written to MP4 metadata. Use when branch names or commit IDs must not appear in the recording."
+        )]
+        no_git_context: bool,
     },
+    /// Show the active Run without changing it
+    #[command(long_about = help::STATUS, after_long_help = help::STATUS_DETAILS)]
+    Status,
     /// Record current action/context
     #[command(long_about = help::NOTE, after_long_help = help::NOTE_DETAILS)]
     Note {
@@ -106,6 +115,12 @@ enum Commands {
             long_help = "Positive timeout in seconds. Put this option before COMMAND. On timeout the test process group is terminated and the wrapper returns 124; the recording stays active and still needs stop.",
             value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: u64,
+        /// Do not record the command's stdout/stderr tails
+        #[arg(
+            long,
+            long_help = "Forward output to the terminal as usual but keep stdout/stderr tails out of the video card and the Run's event log. Use when output may contain secrets. Put this option before COMMAND. Command arguments are still shown (with obvious secrets masked)."
+        )]
+        no_output_summary: bool,
         #[arg(required = true, value_name = "COMMAND", num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true,
             help = "Executable followed by its arguments; no implicit shell",
             long_help = "Executable plus argv, forwarded without an implicit shell. Uses this caller's cwd/environment with closed stdin. Tokens after the executable belong to the child. Use rec test --help for recorder help, or rec test -- PROGRAM --help to run the program's help.")]
@@ -113,7 +128,14 @@ enum Commands {
     },
     /// Finalize a validated MP4 with chapters and optional audio
     #[command(long_about = help::STOP, after_long_help = help::STOP_DETAILS)]
-    Stop,
+    Stop {
+        /// Close a still-running test as "result unknown" before stopping
+        #[arg(
+            long,
+            long_help = "If a test is still marked active (for example its rec test process was killed or cannot be probed), record it as ended with an unknown result and continue stopping. The test process itself is not signalled. Without this flag stop waits for the test; the daemon also closes a test automatically after its timeout plus a grace period."
+        )]
+        abandon_test: bool,
+    },
     #[command(hide = true)]
     Daemon {
         #[arg(long)]
@@ -192,6 +214,25 @@ fn start_run(
     title: Option<String>,
     capture: CaptureOptions,
     output: Option<PathBuf>,
+    no_git_context: bool,
+) -> Result<()> {
+    let mut reserved = None;
+    let result = start_run_inner(title, capture, output, no_git_context, &mut reserved);
+    if result.is_err() {
+        // A Run that never became active must not leave its args/temp directory behind.
+        if let Some(dir) = reserved {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+    result
+}
+
+fn start_run_inner(
+    title: Option<String>,
+    capture: CaptureOptions,
+    output: Option<PathBuf>,
+    no_git_context: bool,
+    reserved: &mut Option<PathBuf>,
 ) -> Result<()> {
     capture.validate()?;
     if let Some(existing) = session::load_session()? {
@@ -205,6 +246,10 @@ fn start_run(
     let mut selected = None;
     for _ in 0..64 {
         let run_id = id::generate_run_id();
+        // The Run:Step reference should stay unambiguous within this project's recordings.
+        if id::run_id_in_recordings(&session::recordings_dir(&workdir), &run_id) {
+            continue;
+        }
         let path = session::run_tmp_dir(&run_id);
         if let Some(p) = path.parent() {
             fs::create_dir_all(p)?;
@@ -212,6 +257,7 @@ fn start_run(
         match fs::create_dir(&path) {
             Ok(()) => {
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+                *reserved = Some(path.clone());
                 selected = Some((run_id, path));
                 break;
             }
@@ -245,6 +291,7 @@ fn start_run(
         workdir,
         output,
         capture,
+        no_git_context,
     };
     id::write_json_atomic(&config, &args)?;
     let log_dir = session::session_dir()?.join("logs");
@@ -277,8 +324,16 @@ fn start_run(
                 if let Some(t) = &title {
                     println!("Title      {t}");
                 }
-                let git = git::GitInfo::collect(std::path::Path::new(&session.workdir));
-                if git.available {
+                let git = if no_git_context {
+                    None
+                } else {
+                    Some(git::GitInfo::collect(std::path::Path::new(
+                        &session.workdir,
+                    )))
+                };
+                if no_git_context {
+                    println!("Git: not collected (--no-git-context)");
+                } else if let Some(git) = git.filter(|g| g.available) {
                     println!(
                         "Repository {}\nBranch     {}\nCommit     {}\nWorking tree {}",
                         git.repository.as_deref().unwrap_or("-"),
@@ -308,7 +363,7 @@ fn start_run(
     }
 }
 
-fn test_run(command: Vec<String>, timeout_secs: u64) -> Result<i32> {
+fn test_run(command: Vec<String>, timeout_secs: u64, no_output_summary: bool) -> Result<i32> {
     // Bind both messages to the SAME socket/run, even if the global session changes.
     let session = session::require_active_session()?;
     runner::install_signal_handlers();
@@ -318,11 +373,16 @@ fn test_run(command: Vec<String>, timeout_secs: u64) -> Result<i32> {
             command: command.clone(),
             cwd: std::env::current_dir()?.display().to_string(),
             owner_pid: std::process::id(),
+            timeout_secs,
         },
     )?;
     let step = begin.step.context("test start response has no step")?;
     print_resp(&begin);
-    let result = runner::execute(&command, Duration::from_secs(timeout_secs), true);
+    let mut result = runner::execute(&command, Duration::from_secs(timeout_secs), true);
+    if no_output_summary {
+        result.stdout_summary.clear();
+        result.stderr_summary.clear();
+    }
     let code = result.cli_exit_code();
     eprintln!(
         "\nCommand exit: {code}; duration: {:.3}s",
@@ -347,7 +407,29 @@ fn run() -> Result<i32> {
             title,
             capture,
             output,
-        } => start_run(title, capture, output)?,
+            no_git_context,
+        } => start_run(title, capture, output, no_git_context)?,
+        Commands::Status => {
+            let r = send_ipc(IpcRequest::Status)?;
+            println!(
+                "Run        {}\nDuration   {}\nSteps      {}\nCheckpoints {}\nTests      {}\nOutput     {}",
+                r.run_id.unwrap_or_default(),
+                r.duration.unwrap_or_default(),
+                r.steps.unwrap_or(0),
+                r.checkpoints.unwrap_or(0),
+                r.tests.unwrap_or(0),
+                r.output.unwrap_or_default()
+            );
+            if let Some(verdict) = r.verdict {
+                println!("{verdict}");
+            }
+            if let Some(test) = r.active_test {
+                println!("Test running: {test}");
+            }
+            if let Some(warning) = r.warning {
+                println!("Warning    {warning}");
+            }
+        }
         Commands::Note { text } => print_resp(&send_ipc(IpcRequest::Note {
             text: join_text(text)?,
         })?),
@@ -364,10 +446,14 @@ fn run() -> Result<i32> {
         Commands::Test {
             command,
             timeout_secs,
-        } => return test_run(command, timeout_secs),
-        Commands::Stop => {
-            let r = send_ipc(IpcRequest::Stop)?;
+            no_output_summary,
+        } => return test_run(command, timeout_secs, no_output_summary),
+        Commands::Stop { abandon_test } => {
+            let r = send_ipc(IpcRequest::Stop { abandon_test })?;
             println!("Recording complete\n\nDuration   {}\nSteps      {}\nCheckpoints {}\nTests      {}\n\n{}", r.duration.unwrap_or_default(), r.steps.unwrap_or(0), r.checkpoints.unwrap_or(0), r.tests.unwrap_or(0), r.output.unwrap_or_default());
+            if let Some(warning) = r.warning {
+                println!("\nWarning: {warning}");
+            }
         }
         Commands::Daemon { config } => daemon::run(serde_json::from_slice(&fs::read(config)?)?)?,
     }
@@ -505,6 +591,7 @@ mod tests {
                 Commands::Test {
                     timeout_secs,
                     command,
+                    ..
                 } => {
                     assert_eq!(timeout_secs, 60);
                     assert_eq!(command, ["npm", "--help", "--timeout-secs", "1"]);
