@@ -1,502 +1,237 @@
 # Agent Work Recorder
 
-**코딩 에이전트가 자신의 작업과 판단을 화면과 함께 기록해, 사람이 MP4 하나만 보고 검토할 수 있게 하는 macOS CLI 도구.**
+**코딩 에이전트가 작업 과정과 자신의 판단을 화면에 기록하고, 사람이 MP4 하나로 검토하는 macOS CLI.**
 
-Agent Work Recorder는 일반적인 화면 녹화기가 아니다. 에이전트가 작업 중 자신의 **행동, 기대 결과, 관찰 결과, 체크포인트**를 명시적으로 기록하고, 이를 실제 작업 화면 위에 Run/Step 정보와 함께 남긴다.
+에이전트는 행동·기대·관찰·테스트 결과를 기록한다. 사람은 영상을 재생하고, `7F32:014` 같은 Run/Step 식별자가 보이는 화면을 캡처해 수정 지시를 전달한다.
 
-사용자는 영상의 특정 장면을 캡처해 다시 에이전트에게 전달할 수 있다. 캡처에는 `7F32:014` 같은 식별자가 항상 남으므로, "어느 실행의 어느 단계가 잘못됐는지"를 다시 참조할 수 있다.
+> **Record claims, not truth.** `Agent verdict: PASS`는 에이전트의 주장이지 도구가 내린 검증 결과가 아니다. 테스트 명령의 종료 코드가 0이어도 자동으로 PASS로 바꾸지 않는다.
 
-> 이 도구는 자동 검증기가 아니다.
->
-> `PASS`, `FAIL`, `Expected`, `Observed`는 **에이전트의 주장**을 기록한 값이다. 최종 검토자는 사람이다.
+## 구현 범위
 
-## 현재 상태
+Phase 1에 이어 **Phase 2의 네 기능**을 제공한다.
 
-현재 구현 범위는 **MVP Phase 1**이다.
-
-| 기능 | 상태 |
+| 기능 | 인터페이스 / 동작 |
 | --- | --- |
-| `rec start` / `stop` | 구현 |
-| `rec note` | 구현 |
-| `rec expect` | 구현 |
-| `rec observe` | 구현 |
-| `rec checkpoint` | 구현 |
-| 전체 화면 녹화 | 구현 |
-| 특정 창 녹화 | 구현 |
-| Window ID 지정 | 구현 |
-| Git metadata 수집 | 구현 |
-| Persistent Run/Step overlay | 구현 |
-| 일시 Event Card | 구현 |
-| H.264 MP4 출력 | 구현 |
-| `rec test` | Phase 2 |
-| 시스템 오디오 | Phase 2 |
-| MP4 chapters | Phase 2 |
-| 애플리케이션 단위 캡처 | Phase 2 |
-
-## 핵심 사용 흐름
-
-```text
-Human gives task
-      │
-      ▼
-Agent
-      │
-      ├─ rec start
-      ├─ rec note
-      ├─ work
-      ├─ rec expect
-      ├─ UI / app verification
-      ├─ rec observe
-      ├─ rec checkpoint
-      └─ rec stop
-      │
-      ▼
-     MP4
-      │
-      ▼
-Human review
-      │
-      ├─ accept
-      └─ screenshot + feedback
-                    │
-                    ▼
-                  Agent
-```
-
-핵심 산출물은 별도 리포트가 아니라 **MP4 하나**다.
-
-## 예시
-
-로그인 오류 UI를 수정하고 검증한다고 가정한다.
-
-```bash
-rec start \
-  --title "로그인 오류 UI 수정" \
-  --window "Google Chrome"
-
-rec note \
-  "로그인 오류 메시지 위치를 수정하고 브라우저에서 확인한다."
-
-rec expect \
-  "잘못된 비밀번호 입력 시 버튼 바로 아래에 오류 메시지가 표시된다."
-
-# 에이전트가 브라우저를 조작하고 결과를 확인한다.
-
-rec observe \
-  --status pass \
-  "오류 메시지가 로그인 버튼 아래에 표시됨"
-
-rec checkpoint \
-  "로그인 실패 최종 화면"
-
-rec stop
-```
-
-기본 출력 위치:
-
-```text
-./recordings/<RUNID>-<title-slug>.mp4
-```
-
-예:
-
-```text
-./recordings/7F32-로그인-오류-ui-수정.mp4
-```
-
-## Run과 Step
-
-한 번의 `rec start`부터 `rec stop`까지를 하나의 **Run**으로 취급한다.
-
-각 Run은 4자리 hexadecimal ID를 가진다.
-
-```text
-7F32
-```
-
-의미 있는 이벤트가 기록될 때마다 Step이 증가한다.
-
-```text
-7F32:001
-7F32:002
-7F32:003
-```
-
-Phase 1에서 Step을 만드는 명령:
-
-```text
-note
-expect
-observe
-checkpoint
-```
-
-화면이 바뀌거나 시간이 흐르는 것만으로는 Step이 증가하지 않는다.
-
-## 화면 오버레이
-
-영상에는 항상 최소한의 persistent HUD가 표시된다.
-
-```text
-7F32:014
-
-Verify login error layout
-
-Agent verdict: PASS
-```
-
-Run/Step 식별자는 영상 전체에서 유지된다. 따라서 사용자가 임의의 프레임을 캡처해도 어떤 실행의 어느 단계인지 식별할 수 있다.
-
-### Event Card
-
-`note`, `expect`, `observe`, `checkpoint`가 발생하면 해당 내용이 일시적인 카드로 표시된다.
-
-예:
-
-```text
-EXPECT
-
-Wrong password should display
-an error below the login button.
-```
-
-카드는 약 4초 뒤 사라진다. 긴 설명은 persistent HUD에 계속 남기지 않는다.
-
-### Git Context
-
-`rec start` 시 현재 작업 디렉터리에서 다음 정보를 수집한다.
-
-- repository name
-- repository root
-- branch
-- HEAD commit hash
-- working tree clean / dirty
-- changed files count
-
-영상 시작 시 Git Context가 잠시 표시되며 이후 화면에서는 제거된다.
-
-Git 저장소가 아니어도 녹화는 계속된다.
-
-```text
-Git: unavailable
-```
-
-## 명령
-
-### 녹화 시작
-
-기본값은 main display 전체 화면이다.
-
-```bash
-rec start
-```
-
-명시적으로 전체 화면:
-
-```bash
-rec start --screen full
-```
-
-제목 지정:
-
-```bash
-rec start --title "Checkout validation"
-```
-
-특정 창:
-
-```bash
-rec start --window "Google Chrome"
-```
-
-Window ID 직접 지정:
-
-```bash
-rec start --window-id 12345
-```
-
-출력 파일 지정:
-
-```bash
-rec start --output ./result.mp4
-```
-
-`--screen`, `--window`, `--window-id`는 동시에 하나만 사용할 수 있다.
-
-특정 창을 요청한 경우, 캡처 실패를 이유로 전체 데스크톱 녹화로 자동 확대하지 않는다. 명시적 캡처 범위를 유지하기 위해 해당 Run을 실패시킨다.
-
-### 현재 행동 기록
-
-```bash
-rec note "CSS spacing 수정"
-```
-
-`note`는 현재 작업 또는 행동 맥락을 기록한다.
-
-### 기대 결과 기록
-
-```bash
-rec expect \
-  "로그인 실패 시 오류 메시지가 버튼 아래 표시된다."
-```
-
-Expectation은 일시적인 Event Card로 표시되며 현재 Action을 영구적으로 덮어쓰지 않는다.
-
-### 관찰 결과 기록
-
-```bash
-rec observe \
-  "오류 메시지가 버튼 아래 표시되었다."
-```
-
-상태를 함께 기록할 수 있다.
-
-```bash
-rec observe \
-  --status pass \
-  "오류 메시지가 예상 위치에 나타남"
-```
-
-지원 상태:
-
-```text
-pass
-fail
-uncertain
-info
-```
-
-`pass`와 `fail`은 제품의 객관적 판정이 아니다.
-
-화면에는 다음처럼 표시된다.
-
-```text
-Agent verdict: PASS
-```
-
-### Checkpoint
-
-```bash
-rec checkpoint "로그인 실패 최종 화면"
-```
-
-사람이 특히 확인해야 할 장면을 표시한다.
-
-현재 Phase 1에서는 Step과 Checkpoint Event Card를 생성한다. MP4 chapter 생성은 Phase 2 범위다.
-
-### 녹화 종료
-
-```bash
-rec stop
-```
-
-성공하면 임시 런타임 파일을 정리하고 최종 MP4 경로를 출력한다.
+| 녹화·주석·관찰 | `start`, `note`, `expect`, `observe`, `checkpoint`, `stop` |
+| 테스트 명령 실행 | `rec test`: 명령, 종료 코드, 실행 시간, 출력 요약 |
+| 시스템 오디오 | `rec start --system-audio`: 기본 OFF, AAC, 마이크 없음 |
+| MP4 챕터 | Setup, 테스트 시작, 체크포인트를 탐색 지점으로 사용 |
+| 앱 단위 캡처 | `rec start --app NAME_OR_BUNDLE_ID`: 주 모니터의 해당 앱 창들 |
+| 화면·창 캡처 | `--screen full`, `--window QUERY`, `--window-id ID` |
+| Git 맥락 | 시작 시 저장소·브랜치·커밋·작업 트리 상태 수집 |
+| 영상 산출물 | Run/Step 오버레이가 포함된 H.264 MP4 하나 |
+
+CI는 빌드, 상태 모델, 실제 CLI/데몬 흐름, 합성 영상·오디오 인코딩, 챕터 보존을 검증한다. **CI 성공은 실제 Mac의 화면 녹화 권한, 앱 격리, 실시간 시스템 오디오까지 검증했다는 뜻이 아니다.** 실기기 점검 항목은 [Phase 2 검증 문서](docs/phase2-validation.md)에 구분해 두었다.
 
 ## 설치
 
-### 요구 사항
-
-- macOS 14+
-- Rust toolchain
-- Swift 5.9+
-- `ffmpeg`
-- Screen Recording 권한
-
-빌드 및 설치:
+macOS 14 이상, Rust stable, Swift 5.9 이상과 macOS SDK, `make`, `ffmpeg`와 `ffprobe`가 필요하다. 테스트에는 Python 3도 사용한다.
 
 ```bash
+# Homebrew를 사용하는 경우 미디어 도구 설치
+brew install ffmpeg
+
+# 저장소 루트에서 빌드·설치
 make install
+export PATH="$HOME/.local/bin:$PATH"
+
+rec --help
 ```
 
-기본 설치 위치:
+기본 설치 위치는 `~/.local/bin/rec`, `~/.local/bin/rec-capture`다. 다른 위치에는 `make install PREFIX=/your/prefix`로 설치한다. `ffmpeg`와 `ffprobe`는 런타임에도 PATH에 있어야 한다.
+
+화면 녹화 권한은 실행하는 터미널 또는 에이전트에 부여한다.
 
 ```text
-~/.local/bin/rec
-~/.local/bin/rec-capture
+System Settings > Privacy & Security > Screen & System Audio Recording
 ```
 
-필요하면 `~/.local/bin`을 `PATH`에 추가한다.
+macOS 버전에 따라 항목 이름이 다를 수 있다. 권한을 부여한 뒤 해당 프로세스를 다시 실행한다. 마이크 권한은 필요하지 않다.
+
+## 한 번의 작업 기록
 
 ```bash
-export PATH="$HOME/.local/bin:$PATH"
+# Safari의 주 모니터 창들을 녹화한다. 오디오는 기본 OFF.
+rec start --title "로그인 오류 UI 검증" --app com.apple.Safari
+
+rec note "로그인 오류 메시지의 위치를 확인한다."
+
+# 실제 프로젝트에서 실행할 명령으로 바꾼다.
+rec test npm test -- auth.test.ts
+
+rec expect "잘못된 비밀번호 입력 시 버튼 바로 아래에 오류가 표시된다."
+
+# 에이전트가 브라우저를 조작하고 결과를 확인한다.
+# 카드를 읽을 수 있도록 이벤트를 무의미하게 연속 전송하지 않는다.
+
+rec observe --status pass "오류 메시지가 로그인 버튼 아래에 표시됨"
+rec checkpoint "로그인 실패 최종 화면"
+rec stop
 ```
 
-## macOS 권한
+`rec test`는 실행한 명령의 종료 코드를 반환한다. 셸에서 `set -e`를 사용하면 실패한 테스트 때문에 후속 `rec stop`이 실행되지 않을 수 있으므로, 자동화 스크립트는 종료 처리를 별도로 보장해야 한다.
 
-화면 캡처를 실행하는 터미널 또는 에이전트 프로세스에 Screen Recording 권한이 필요하다.
+기본 산출물은 **`rec start`를 실행한 디렉터리**의 `recordings/<RUNID>-<title-slug>.mp4`다. 제목이 없으면 `<RUNID>.mp4`를 사용한다. `--output ./review.mp4`로 변경할 수 있으며 기존 파일은 덮어쓰지 않는다.
+
+## 녹화 대상과 오디오
+
+다음 `start` 예제는 서로 다른 선택지다. 동시에 여러 Run을 실행할 수 없다.
+
+```bash
+rec start --screen full
+rec start --window "로그인 - Google Chrome"
+rec start --window-id 12345
+rec start --app com.google.Chrome
+rec start --app com.apple.Safari --system-audio
+```
+
+`--screen`, `--window`, `--window-id`, `--app` 중 하나만 지정한다. 생략하면 주 모니터 전체를 선택한다.
+
+**앱 캡처**는 정확한 앱 이름 또는 bundle ID를 받는다. 주 모니터에서 선택된 실행 중 앱의 창들을 포함하는 ScreenCaptureKit 필터를 사용한다. 다른 앱이나 다른 모니터로 자동 확대하지 않는다. 앱 이름이 모호하면 bundle ID를 지정한다. 실행 중인 앱·창의 식별자는 다음 명령으로 확인한다.
+
+```bash
+rec-capture list-apps
+rec-capture list-windows
+rec-capture list-displays
+```
+
+**창 캡처**의 `--window`는 제목 또는 앱 이름의 부분 문자열로 찾는다. 결과가 여러 개이면 임의의 창을 선택하지 않고 `--window-id` 지정을 요구한다. 앱 재시작 후 자동 재연결과 여러 모니터 동시 녹화는 지원하지 않는다. 대상 소실 시에는 마지막 프레임에 `CAPTURE TARGET LOST`를 표시하고 명시적인 `rec stop`을 기다리는 경로를 사용한다.
+
+**시스템 오디오**는 `--system-audio`를 지정했을 때만 48 kHz 스테레오 AAC로 기록한다. 마이크 입력은 구성하지 않는다. 전체 화면 캡처에서는 시스템 오디오, 앱 캡처에서는 선택한 앱의 오디오가 대상이다. **한 창만 녹화해도 오디오 필터는 창이 아니라 앱 단위**이므로 같은 앱의 다른 창에서 재생되는 소리가 포함될 수 있다.
+
+앱·창 캡처나 오디오를 요청한 상태에서 네이티브 캡처가 실패하면 전체 화면 또는 무음 영상으로 대체하지 않는다. 오디오를 요청했지만 AAC 트랙이 생성되지 않으면 `stop`도 성공으로 처리하지 않는다.
+
+### 스크린샷 대체 경로
+
+기존 CuaDriver 스크린샷 경로는 **주 모니터 전체·오디오 OFF**일 때만 허용된다. CuaDriver가 실행 중이어야 하며, 필요하면 `REC_CUA_BIN`, `REC_CUA_SOCKET`으로 지정한다. 이 경로는 네이티브 30 fps 녹화보다 성긴 화면 기록이며 프레임 간 실제 경과 시간을 반영한다. CuaDriver 없이도 일반 ScreenCaptureKit 경로는 동작한다.
+
+## `rec test`
+
+```bash
+rec test npm test -- auth.test.ts
+rec test --timeout-secs 60 -- cargo test
+rec test -- sh -c 'printf "result\n"; exit 7'
+```
+
+명령은 **`rec test`를 호출한 프로세스의 현재 디렉터리와 환경변수**에서 실행된다. 암묵적으로 셸을 거치지 않으므로 파이프·리다이렉션 등이 필요하면 `sh -c`를 직접 지정한다. 테스트는 신뢰할 수 있는 명령만 실행해야 하며 이 도구가 명령을 샌드박싱하지는 않는다.
+
+| 기록 | 내용 |
+| --- | --- |
+| 시작 | 인자 목록을 표시한 명령, 호출 디렉터리, 실행 중 상태 |
+| 완료 | 실제 종료 코드 또는 시그널, 실행 시간, 타임아웃·실행 실패 여부 |
+| 출력 | stdout/stderr를 터미널로 전달하고 각 스트림 끝부분 최대 4 KiB를 내부 기록에 유지 |
+| 영상 | 명령·종료 코드·시간과 제한된 길이의 출력 요약을 TEST 카드에 표시 |
+
+반환 코드는 명령 종료 코드 그대로다. 타임아웃은 `124`, 실행 파일을 시작하지 못한 경우는 `127`, 시그널 종료는 `128 + signal`이다. 녹화기 통신 등 도구 자체의 실패는 `1`이다. 프로그램이 원래 124나 127을 반환하는 경우도 있으므로 정확한 사유는 카드와 기록을 함께 구분한다.
+
+기본 제한 시간은 300초다. `--timeout-secs`는 실행할 명령 **앞에** 둔다. stdin은 연결하지 않는 비대화형 실행이며, 제한 시간 또는 인터럽트 시 테스트 프로세스 그룹을 종료한다. 백그라운드 서버를 남기는 용도로 사용하지 않는다.
+
+테스트 실행 중에도 데몬은 `note` 등의 명령을 받는다. 다만 두 번째 테스트 실행과 `stop`은 거부한다. 실행 결과가 다른 Run에 들어가지 않도록 시작 시의 세션과 테스트 식별자에 완료 이벤트를 연결한다.
+
+**한 번의 `rec test`는 테스트 1건으로 집계하고 시작·완료에 각각 Step을 만든다.** 이전 관찰의 PASS 표시는 테스트 시작 시 지우며 종료 코드 0만으로 새 PASS를 만들지 않는다. 실행 결과에 대한 에이전트 판단은 별도의 `rec observe --status ...`로 남긴다.
+
+## Run, Step, 주석과 챕터
+
+Run은 `start`부터 `stop`까지의 실행이며 4자리 16진수 ID를 가진다. `7F32:014`는 Run `7F32`의 14번째 이벤트다. 화면 변화나 시간 경과만으로 Step이 증가하지 않는다.
+
+| 명령 | 의미 |
+| --- | --- |
+| `rec note "..."` | 현재 행동·맥락을 기록하고 짧은 상시 Action을 갱신 |
+| `rec expect "..."` | 기대 결과를 카드로 표시; 상시 Action은 유지 |
+| `rec observe --status pass|fail|uncertain|info "..."` | 에이전트 관찰·주장; 상태 생략 시 info |
+| `rec checkpoint "..."` | 사람이 확인할 장면과 챕터 경계 |
+| `rec test ...` | 명령의 시작과 기계적 실행 결과 |
+
+Run/Step을 영상에 합성하고 주석 카드는 약 4초 표시한다. 다음 이벤트가 먼저 도착하면 이전 카드를 교체하므로 전체 이벤트 로그를 모두 읽을 수 있는 영상으로 만들려면 설명 사이에 검토 시간을 확보해야 한다. Git 맥락은 시작 시 약 4.5초 표시한다. 정지 화면에서도 프레임 타이머가 오버레이를 갱신한다.
+
+`rec stop`은 마지막 카드의 남은 표시 시간을 확보한 뒤 파일을 마무리한다. 따라서 마지막 이벤트 직후 호출하면 인코딩 시간 외에 최대 약 4초의 표시 시간이 추가될 수 있다. 긴 설명은 화면 크기에 맞춰 줄바꿈·축약하며, 창이 너무 작으면 검토할 정보가 잘릴 수 있으므로 충분한 크기의 창을 선택한다.
+
+### MP4 챕터 정책
+
+챕터는 **Setup → 테스트 시작 → 체크포인트**를 기준으로 만든다. `note`, `expect`, `observe`, 테스트 완료마다 챕터를 만들지는 않는다. 같은 밀리초의 경계는 하나로 합치고 마지막 챕터는 실제 영상 길이에서 끝낸다.
+
+챕터 시간은 벽시계 변경에 영향을 받지 않는 경과 시간을 기준으로 계산한다. 종료 시 FFmpeg로 챕터와 메타데이터를 넣고, FFprobe로 H.264/AAC 유무, 챕터 제목·경계가 보존됐는지 확인한다. 재생기의 챕터 UI 지원 여부와 상관없이 핵심 설명은 영상에 표시한다.
+
+```bash
+ffprobe -v error -show_chapters -show_streams -of json ./review.mp4
+```
+
+## 사람이 검토하는 방법
 
 ```text
-System Settings
-  > Privacy & Security
-  > Screen & System Audio Recording
+작업 지시 → 에이전트 작업·기록 → MP4 → 사람 검토
+                                        ↓
+                              Run/Step 캡처 + 텍스트
+                                        ↓
+                                  다음 수정 Run
 ```
 
-권한을 부여한 뒤 해당 터미널 또는 에이전트 프로세스를 다시 실행한다.
+예를 들어 `7F32:021`이 보이는 장면을 캡처하고 “오류 메시지가 버튼과 너무 붙어 있다. 8px 더 떨어뜨려라”라고 전달한다. 도구 내부에 댓글 시스템을 만들지 않으며 최종 검토자는 사람이다.
 
-권한이 없으면 녹화를 시작하지 않는다.
+## 데이터와 개인정보
 
-## 설계 원칙
-
-### Record claims, not truth
-
-도구는 에이전트가 "무엇을 했다고 주장하는지"와 "무엇을 봤다고 판단하는지"를 기록한다.
-
-자동으로 UI가 올바른지 판단하지 않는다.
-
-### Human remains the reviewer
-
-최종 검증자는 사람이다.
-
-### Video first
-
-사용자는 추가 JSON이나 HTML 리포트 없이 MP4만으로 핵심 작업 흐름을 검토할 수 있어야 한다.
-
-### Explicit recording
-
-`rec start` 없이는 녹화하지 않는다.
-
-상시 백그라운드 녹화를 하지 않는다.
-
-### Screenshot-addressable
-
-모든 프레임에서 Run/Step을 식별할 수 있어야 한다.
-
-이를 통해 다음과 같은 피드백이 가능하다.
+녹화는 명시적으로 시작·종료하며 사용자 영상을 클라우드에 업로드하지 않는다. 결과물은 MP4 하나지만 실행 중에는 내부 파일을 사용한다.
 
 ```text
-[7F32:021가 보이는 screenshot]
-
-오류 메시지가 버튼과 너무 붙어 있다.
-간격을 늘려라.
+~/.agent-recorder/session                 현재 세션
+~/.agent-recorder/logs/<RUNID>.log        진단 로그
+<OS temp>/agent-recorder/<RUNID>/
+    args.json
+    session.json
+    events.jsonl
+    raw.mp4
+    chapters.ffmetadata
 ```
 
-## 개인정보 보호
+macOS의 실제 임시 디렉터리는 `/tmp`와 다를 수 있다. 최종 파일 검증·게시 성공 후 Run 임시 디렉터리를 삭제한다. 실패하면 원본을 보존하며, 진단 로그는 정상 종료 후에도 남는다. 영상뿐 아니라 명령 인자·출력 요약·화면에 민감한 정보가 포함될 수 있으므로 입력과 보관 범위를 검토해야 한다.
 
-Phase 1의 기본 정책:
-
-- 명시적 `rec start` 없이는 녹화하지 않는다.
-- 백그라운드 상시 녹화를 하지 않는다.
-- 클라우드로 데이터를 전송하지 않는다.
-- 결과물은 로컬에만 저장한다.
-- 마이크를 녹음하지 않는다.
-- 특정 창 요청을 전체 데스크톱 녹화로 자동 확대하지 않는다.
-
-시스템 오디오는 아직 지원하지 않으며 Phase 2에서 명시적 opt-in으로 추가할 예정이다.
+오류를 확인할 때는 출력된 Run ID에 해당하는 로그를 읽는다. 테스트가 아직 실행 중이면 끝낸 뒤 `rec stop`을 호출한다. 파일 마무리에 실패했으면 의존성·출력 경로 등 원인을 수정한 후 동일 세션의 `rec stop`을 다시 시도할 수 있다. 프로세스 충돌 후 세션 복구나 손상된 MP4 복원은 제공하지 않는다.
 
 ## 내부 구조
 
 ```text
 rec CLI (Rust)
-    │
-    │ Unix Domain Socket
-    ▼
+  ├─ test: 호출 환경에서 subprocess 실행
+  └─ Unix Domain Socket
+        ↓
 Recorder Daemon (Rust)
-    │
-    ├─ Run / Step state
-    ├─ Git metadata
-    ├─ events.jsonl
-    └─ capture control
-            │
-            ▼
-      rec-capture (Swift)
-            │
-            ├─ ScreenCaptureKit
-            ├─ overlay rendering
-            └─ H.264 MP4
+  ├─ 단일 Run 잠금 / 이벤트 / 테스트 상태 / Git 정보
+  ├─ ScreenCaptureKit helper 제어
+  └─ FFmpeg + FFprobe: 챕터·오디오 보존 검증 후 MP4 게시
+        ↓
+rec-capture (Swift)
+  ├─ display / window / application 필터
+  ├─ 선택적 system audio → AAC
+  └─ 직렬 media queue → 오버레이 + H.264 MP4
 ```
 
-사용자에게는 MP4만 제공하지만 실행 중에는 내부적으로 임시 상태와 이벤트 파일을 사용할 수 있다.
+Rust 모듈은 `runner.rs`(테스트 실행), `media.rs`(챕터·최종화), `daemon.rs`(세션과 IPC), `protocol.rs`(계약)로 나뉜다. Swift는 `MediaWriter.swift`, `Overlay.swift`, 캡처 진입점으로 나뉘며 합성 인코딩 테스트도 같은 writer를 사용한다.
 
-```text
-/tmp/agent-recorder/<RUNID>/
-    raw.mp4
-    events.jsonl
-    session.json
-```
-
-`rec stop`의 finalization이 성공하면 임시 디렉터리를 삭제한다.
-
-현재 세션 정보는 다음 경로에서 관리한다.
-
-```text
-~/.agent-recorder/session
-```
-
-MVP에서는 동시에 하나의 Run만 허용한다.
-
-## 개발
-
-Rust 테스트:
+## 개발과 검증
 
 ```bash
 cargo test --all-targets
-```
-
-Swift capture helper 빌드:
-
-```bash
+swift test --package-path macos/RecCapture
 swift build -c release --package-path macos/RecCapture
+cargo build
+python3 tests/e2e.py
 ```
 
-전체 release 빌드:
+네이티브 인코더를 화면 권한 없이 확인할 수도 있다. 아래 출력은 **실제 작업 화면이 아닌 합성 테스트 영상**이다.
 
 ```bash
-make
+macos/RecCapture/.build/release/rec-capture self-test \
+  --output ./synthetic.mp4 --system-audio
 ```
 
-설치:
+CI는 위 테스트를 실행하고 합성 MP4·FFprobe 결과를 artifact로 남긴다. CI artifact 업로드는 테스트 데이터에만 적용되며 `rec`의 사용자 녹화 업로드 기능이 아니다. 실기기 권한·앱 격리·오디오 검증은 [별도 절차](docs/phase2-validation.md)를 따른다.
 
-```bash
-make install
-```
+## 비목표와 제한
 
-CI는 macOS runner에서 Rust 테스트와 Swift release 빌드를 모두 실행한다.
+Windows/Linux, 마이크 녹음, 자동 UI 정답 판정, 클라우드 리뷰 시스템, 행동 재생, 자동 Git commit/PR 생성, 별도 사용자 JSON/HTML 리포트는 제공하지 않는다. `rec status`, `pause`, `resume`, `cancel`, 수동 `chapter` 명령은 아직 제공하지 않는다.
 
-## Phase 2
-
-다음 기능은 PRD상 Phase 2다.
-
-### `rec test`
-
-에이전트가 subprocess를 실행하고 다음 정보를 영상에 기록한다.
-
-- command
-- exit code
-- duration
-- stdout/stderr summary
-
-단순히 exit code 0이라고 해서 자동으로 `PASS`로 판정하지 않는다.
-
-### System audio
-
-```bash
-rec start --system-audio
-```
-
-기본값 OFF. 마이크는 계속 지원하지 않는다.
-
-### MP4 chapters
-
-Step과 별도로 사람이 긴 영상을 탐색하기 위한 큰 작업 단위를 MP4 chapter metadata로 기록한다.
-
-### Application capture
-
-특정 Window가 아니라 애플리케이션 단위 캡처를 추가한다.
-
-## Non-goals
-
-현재 제품은 다음을 목표로 하지 않는다.
-
-- Windows / Linux 지원
-- 클라우드 업로드
-- 웹 기반 리뷰 시스템
-- AI 자동 영상 분석
-- 자동 UI 정답 판정
-- 에이전트 행동 재생
-- 자동 Git commit 또는 PR 생성
-- 마이크 녹음
-- 별도 JSON/HTML 사용자 리포트
+현재 앱 캡처 범위는 주 모니터다. 여러 모니터 동시 캡처, 앱 재시작 후 재연결, 실행 환경 스냅샷은 지원하지 않는다. 4자리 Run ID는 짧은 피드백 참조이며 모든 과거 실행에 대해 전역 유일성을 보장하는 식별자는 아니다.
 
 ## License
 
-MIT
+`Cargo.toml`의 라이선스 표기는 MIT다.
