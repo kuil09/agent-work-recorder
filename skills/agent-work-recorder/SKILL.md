@@ -114,8 +114,9 @@ present synthetic fixtures as live screen-capture or permission-validation evide
 
 Return the MP4 path, Run ID, useful Step references, mechanical test results, your actual
 observations and unverified items. Human acceptance is separate from an agent verdict.
-Do not auto-upload or change the repository. Share through an external service only when
-authorized. Do not substitute internal JSON or logs for the requested MP4 deliverable.
+Recording itself does not authorize uploads, commits, pushes or PRs; perform those only
+when included in the user's task. Authorized coding changes can be recorded as requested.
+Do not substitute internal JSON or logs for the requested MP4 deliverable.
 
 ## 7. Apply human feedback in a new Run
 
