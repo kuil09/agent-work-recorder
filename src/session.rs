@@ -140,8 +140,12 @@ fn clear_session_at(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to clear session {}; cleanup did not complete", path.display())),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to clear session {}; cleanup did not complete",
+                path.display()
+            )
+        }),
     }
 }
 
@@ -182,26 +186,40 @@ mod tests {
         fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let root = std::env::temp_dir().join(format!(
-                "rec-s7-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+                "rec-s7-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&root).unwrap();
             let session = root.join("session");
             let socket = root.join("run.sock");
             let listener = UnixListener::bind(&socket).unwrap();
             let value = SessionFile {
-                run_id: "7F32".into(), pid: std::process::id(),
-                socket: socket.display().to_string(), workdir: root.display().to_string(),
-                output: root.join("review.mp4").display().to_string(), title: None,
+                run_id: "7F32".into(),
+                pid: std::process::id(),
+                socket: socket.display().to_string(),
+                workdir: root.display().to_string(),
+                output: root.join("review.mp4").display().to_string(),
+                title: None,
             };
             let bytes = serde_json::to_vec(&value).unwrap();
             fs::write(&session, &bytes).unwrap();
-            Self { root, session, socket, listener, bytes }
+            Self {
+                root,
+                session,
+                socket,
+                listener,
+                bytes,
+            }
         }
 
         fn assert_unchanged(&self, session_inode: u64, socket_inode: u64) {
             assert_eq!(fs::read(&self.session).unwrap(), self.bytes);
             assert_eq!(fs::metadata(&self.session).unwrap().ino(), session_inode);
-            assert_eq!(fs::symlink_metadata(&self.socket).unwrap().ino(), socket_inode);
+            assert_eq!(
+                fs::symlink_metadata(&self.socket).unwrap().ino(),
+                socket_inode
+            );
             // The original listening endpoint remains reachable from the host.
             let _client = UnixStream::connect(&self.socket).unwrap();
             let _server = self.listener.accept().unwrap();
@@ -209,7 +227,9 @@ mod tests {
     }
 
     impl Drop for Fixture {
-        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.root); }
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 
     #[test]
@@ -221,18 +241,36 @@ mod tests {
 
     #[test]
     fn only_esrch_is_confirmed_exit() {
-        assert!(matches!(probe_process_with(1, |_| Ok(())), ProcessState::Running));
-        assert!(matches!(probe_process_with(1, |_| Err(io::Error::from_raw_os_error(3))), ProcessState::Exited));
+        assert!(matches!(
+            probe_process_with(1, |_| Ok(())),
+            ProcessState::Running
+        ));
+        assert!(matches!(
+            probe_process_with(1, |_| Err(io::Error::from_raw_os_error(3))),
+            ProcessState::Exited
+        ));
         for errno in [1, 2, 4, 5, 13, 22] {
-            assert!(matches!(probe_process_with(1, |_| Err(io::Error::from_raw_os_error(errno))), ProcessState::Unknown(_)));
+            assert!(matches!(
+                probe_process_with(1, |_| Err(io::Error::from_raw_os_error(errno))),
+                ProcessState::Unknown(_)
+            ));
         }
-        assert!(matches!(probe_process_with(1, |_| Err(io::Error::new(io::ErrorKind::NotFound, "not ESRCH"))), ProcessState::Unknown(_)));
+        assert!(matches!(
+            probe_process_with(1, |_| Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "not ESRCH"
+            ))),
+            ProcessState::Unknown(_)
+        ));
     }
 
     #[test]
     fn invalid_pids_never_probe_a_process_group() {
         for pid in [0, i32::MAX as u32 + 1, u32::MAX] {
-            assert!(matches!(probe_process_with(pid, |_| panic!("must not call kill")), ProcessState::Unknown(_)));
+            assert!(matches!(
+                probe_process_with(pid, |_| panic!("must not call kill")),
+                ProcessState::Unknown(_)
+            ));
             assert!(!pid_alive(pid));
         }
     }
@@ -240,7 +278,10 @@ mod tests {
     #[test]
     fn real_current_process_is_running_and_reaped_child_is_exited() {
         assert!(pid_alive(std::process::id()));
-        let mut child = std::process::Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
         let pid = child.id();
         child.wait().unwrap();
         assert!(matches!(probe_process(pid), ProcessState::Exited));
@@ -254,13 +295,16 @@ mod tests {
         let b = fs::symlink_metadata(&f.socket).unwrap().ino();
         let error = load_session_with(&f.session, |pid| {
             probe_process_with(pid, |_| Err(io::Error::from_raw_os_error(1)))
-        }).unwrap_err();
+        })
+        .unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("left unchanged"));
         assert!(message.contains("authorized host context"));
         assert!(!message.contains("No active recording"));
         f.assert_unchanged(a, b);
-        assert!(load_session_with(&f.session, probe_process).unwrap().is_some());
+        assert!(load_session_with(&f.session, probe_process)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -269,7 +313,12 @@ mod tests {
             let f = Fixture::new();
             let a = fs::metadata(&f.session).unwrap().ino();
             let b = fs::symlink_metadata(&f.socket).unwrap().ino();
-            assert!(load_session_with(&f.session, |pid| probe_process_with(pid, |_| Err(io::Error::from_raw_os_error(errno)))).is_err());
+            assert!(
+                load_session_with(&f.session, |pid| probe_process_with(pid, |_| Err(
+                    io::Error::from_raw_os_error(errno)
+                )))
+                .is_err()
+            );
             f.assert_unchanged(a, b);
         }
     }
@@ -279,16 +328,29 @@ mod tests {
         let f = Fixture::new();
         let a = fs::metadata(&f.session).unwrap().ino();
         let b = fs::symlink_metadata(&f.socket).unwrap().ino();
-        assert!(load_session_with(&f.session, |pid| probe_process_with(pid, |_| Err(io::Error::from_raw_os_error(3)))).unwrap().is_none());
+        assert!(
+            load_session_with(&f.session, |pid| probe_process_with(pid, |_| Err(
+                io::Error::from_raw_os_error(3)
+            )))
+            .unwrap()
+            .is_none()
+        );
         f.assert_unchanged(a, b);
     }
 
     #[test]
     fn missing_corrupt_and_unreadable_sessions_are_distinct() {
         let f = Fixture::new();
-        assert!(load_session_with(&f.root.join("missing"), |_| panic!("no PID to probe")).unwrap().is_none());
+        assert!(
+            load_session_with(&f.root.join("missing"), |_| panic!("no PID to probe"))
+                .unwrap()
+                .is_none()
+        );
         fs::write(&f.session, "not JSON").unwrap();
-        assert!(load_session_with(&f.session, |_| panic!("corrupt session")).unwrap_err().to_string().contains("corrupt session"));
+        assert!(load_session_with(&f.session, |_| panic!("corrupt session"))
+            .unwrap_err()
+            .to_string()
+            .contains("corrupt session"));
         assert_eq!(fs::read_to_string(&f.session).unwrap(), "not JSON");
         // Reading a directory deterministically fails even when tests run as root.
         assert!(load_session_with(&f.root, |_| panic!("unreadable session")).is_err());
