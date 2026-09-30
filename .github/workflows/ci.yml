@@ -2,15 +2,52 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Rust tests
+      - name: Media dependencies
+        run: |
+          command -v ffmpeg >/dev/null || brew install ffmpeg
+          ffmpeg -version
+          ffprobe -version
+      - name: Rust unit and MP4 round-trip tests
         run: cargo test --all-targets
-      - name: Swift capture helper build
+      - name: Swift unit tests
+        run: swift test --package-path macos/RecCapture
+      - name: Swift capture helper release build
         run: swift build -c release --package-path macos/RecCapture
+      - name: Native synthetic H.264 and AAC encoding (no TCC access)
+        run: |
+          mkdir -p artifacts
+          macos/RecCapture/.build/release/rec-capture self-test --output artifacts/synthetic-video-only.mp4
+          macos/RecCapture/.build/release/rec-capture self-test --output artifacts/synthetic-with-audio.mp4 --system-audio
+          ffprobe -v error -show_streams -show_format -of json artifacts/synthetic-video-only.mp4 > artifacts/video-only.json
+          ffprobe -v error -show_streams -show_format -of json artifacts/synthetic-with-audio.mp4 > artifacts/with-audio.json
+          python3 tests/check_synthetic_media.py artifacts
+      - name: CLI and daemon end-to-end scenarios (synthetic capture)
+        run: |
+          cargo build
+          python3 tests/e2e.py
+      - name: Upload synthetic media evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-media-evidence
+          path: artifacts/
+          if-no-files-found: ignore

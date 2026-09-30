@@ -2,88 +2,95 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ObserveStatus {
-    Pass,
-    Fail,
-    Uncertain,
-    Info,
-}
-
+pub enum ObserveStatus { Pass, Fail, Uncertain, Info }
 impl ObserveStatus {
     pub fn as_verdict_label(self) -> Option<&'static str> {
         match self {
-            ObserveStatus::Pass => Some("Agent verdict: PASS"),
-            ObserveStatus::Fail => Some("Agent verdict: FAIL"),
-            ObserveStatus::Uncertain => Some("Agent verdict: UNCERTAIN"),
-            ObserveStatus::Info => None,
+            Self::Pass => Some("Agent verdict: PASS"),
+            Self::Fail => Some("Agent verdict: FAIL"),
+            Self::Uncertain => Some("Agent verdict: UNCERTAIN"),
+            Self::Info => None,
         }
     }
-
     pub fn as_str(self) -> &'static str {
-        match self {
-            ObserveStatus::Pass => "pass",
-            ObserveStatus::Fail => "fail",
-            ObserveStatus::Uncertain => "uncertain",
-            ObserveStatus::Info => "info",
-        }
+        match self { Self::Pass => "pass", Self::Fail => "fail", Self::Uncertain => "uncertain", Self::Info => "info" }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EventKind {
-    Note,
-    Expect,
-    Observe,
-    Checkpoint,
-    Git,
-}
-
+#[serde(rename_all = "snake_case")]
+pub enum EventKind { Note, Expect, Observe, Checkpoint, Git, TestStart, TestResult }
 impl EventKind {
     pub fn as_card_title(self) -> &'static str {
         match self {
-            EventKind::Note => "NOTE",
-            EventKind::Expect => "EXPECT",
-            EventKind::Observe => "OBSERVE",
-            EventKind::Checkpoint => "CHECKPOINT",
-            EventKind::Git => "CONTEXT",
+            Self::Note => "NOTE", Self::Expect => "EXPECT", Self::Observe => "OBSERVE",
+            Self::Checkpoint => "CHECKPOINT", Self::Git => "CONTEXT",
+            Self::TestStart | Self::TestResult => "TEST",
         }
+    }
+}
+
+/// Mechanical command results, never an agent verdict. Output summaries are bounded tails.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TestResult {
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub duration_ms: u64,
+    pub timed_out: bool,
+    pub stdout_summary: String,
+    pub stderr_summary: String,
+    pub error: Option<String>,
+}
+impl TestResult {
+    pub fn cli_exit_code(&self) -> i32 {
+        if self.timed_out { 124 }
+        else if self.error.is_some() { 127 }
+        else { self.exit_code.unwrap_or_else(|| 128 + self.signal.unwrap_or(1)) }
+    }
+    pub fn card_body(&self, command: &str) -> String {
+        let exit = self.exit_code.map(|n| n.to_string()).unwrap_or_else(|| {
+            self.signal.map(|n| format!("signal {n}")).unwrap_or_else(|| "unavailable".into())
+        });
+        let mut s = format!("Command: {}\nExit: {exit} | Duration: {:.3}s{}",
+            crate::runner::display_text(command, 200), self.duration_ms as f64 / 1000.0,
+            if self.timed_out { " | TIMEOUT" } else { "" });
+        if let Some(e) = &self.error { s.push_str(&format!("\nError: {}", crate::runner::display_text(e, 200))); }
+        for (label, value) in [("stdout", &self.stdout_summary), ("stderr", &self.stderr_summary)] {
+            if !value.is_empty() { s.push_str(&format!("\n{label}: {}", crate::runner::display_text(value, 180))); }
+        }
+        s
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunEvent {
     pub ts_ms: u64,
+    /// Monotonic milliseconds on the capture timeline, not wall-clock subtraction.
+    pub media_ms: u64,
     pub step: u32,
     pub step_id: String,
     pub kind: EventKind,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ObserveStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_result: Option<TestResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "lowercase")]
+#[serde(tag = "op", rename_all = "snake_case")]
 pub enum IpcRequest {
-    Note {
-        text: String,
-    },
-    Expect {
-        text: String,
-    },
-    Observe {
-        text: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        status: Option<ObserveStatus>,
-    },
-    Checkpoint {
-        text: String,
-    },
+    Note { text: String },
+    Expect { text: String },
+    Observe { text: String, status: Option<ObserveStatus> },
+    Checkpoint { text: String },
+    TestBegin { command: Vec<String>, cwd: String, owner_pid: u32 },
+    TestEnd { run_id: String, test_step: u32, result: TestResult },
     Stop,
     Status,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IpcResponse {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -105,35 +112,22 @@ pub struct IpcResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoints: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tests: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict: Option<String>,
 }
-
 impl IpcResponse {
-    pub fn err(msg: impl Into<String>) -> Self {
-        IpcResponse {
-            ok: false,
-            error: Some(msg.into()),
-            run_id: None,
-            step: None,
-            step_id: None,
-            kind: None,
-            output: None,
-            duration: None,
-            steps: None,
-            checkpoints: None,
-            verdict: None,
-        }
-    }
+    pub fn err(msg: impl Into<String>) -> Self { Self { error: Some(msg.into()), ..Self::default() } }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CaptureHud {
     pub cmd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub step: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // Null MUST be transmitted: omitting this field leaves a stale PASS in the helper.
     pub verdict: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
@@ -154,30 +148,22 @@ pub struct CaptureHud {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn pass_is_claim_not_truth() {
-        assert_eq!(
-            ObserveStatus::Pass.as_verdict_label(),
-            Some("Agent verdict: PASS")
-        );
+        assert_eq!(ObserveStatus::Pass.as_verdict_label(), Some("Agent verdict: PASS"));
         assert_eq!(ObserveStatus::Info.as_verdict_label(), None);
+        assert!(!TestResult { exit_code: Some(0), ..Default::default() }.card_body("true").contains("PASS"));
     }
-
     #[test]
     fn ipc_roundtrip() {
-        let req = IpcRequest::Observe {
-            text: "ok".into(),
-            status: Some(ObserveStatus::Pass),
-        };
+        let req = IpcRequest::Observe { text: "ok".into(), status: Some(ObserveStatus::Pass) };
         let json = serde_json::to_string(&req).unwrap();
-        let back: IpcRequest = serde_json::from_str(&json).unwrap();
-        match back {
-            IpcRequest::Observe { text, status } => {
-                assert_eq!(text, "ok");
-                assert_eq!(status, Some(ObserveStatus::Pass));
-            }
-            _ => panic!("wrong variant"),
-        }
+        assert!(matches!(serde_json::from_str::<IpcRequest>(&json).unwrap(), IpcRequest::Observe { status: Some(ObserveStatus::Pass), .. }));
+    }
+    #[test]
+    fn clearing_verdict_is_explicit() {
+        let json = serde_json::to_value(CaptureHud { cmd: "hud".into(), ..Default::default() }).unwrap();
+        assert!(json.as_object().unwrap().contains_key("verdict"));
+        assert!(json["verdict"].is_null());
     }
 }

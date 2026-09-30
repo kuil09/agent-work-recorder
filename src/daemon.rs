@@ -1,721 +1,334 @@
 use crate::git::GitInfo;
 use crate::id::{format_step_id, write_json_atomic};
-use crate::protocol::{CaptureHud, EventKind, IpcRequest, IpcResponse, ObserveStatus, RunEvent};
+use crate::protocol::{CaptureHud, EventKind, IpcRequest, IpcResponse, ObserveStatus, RunEvent, TestResult};
 use crate::session::{self, SessionFile};
-use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use anyhow::{bail, ensure, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub struct DaemonArgs {
-    pub run_id: String,
-    pub title: Option<String>,
-    pub workdir: PathBuf,
-    pub output: PathBuf,
+#[derive(Debug, Clone, Default, clap::Args, Serialize, Deserialize)]
+pub struct CaptureOptions {
+    /// Capture the main display (only `full` is supported)
+    #[arg(long, conflicts_with_all = ["window", "window_id", "app"]) ]
     pub screen: Option<String>,
+    /// Window title/application substring; prefer --window-id when ambiguous
+    #[arg(long, conflicts_with_all = ["screen", "window_id", "app"]) ]
     pub window: Option<String>,
+    #[arg(long, conflicts_with_all = ["screen", "window", "app"]) ]
     pub window_id: Option<u32>,
+    /// Exact application name or bundle ID; its windows on the main display
+    #[arg(long, conflicts_with_all = ["screen", "window", "window_id"]) ]
+    pub app: Option<String>,
+    /// Opt in to system/app audio; NEVER records the microphone
+    #[arg(long)]
+    pub system_audio: bool,
 }
-
+impl CaptureOptions {
+    pub fn validate(&self) -> Result<()> {
+        ensure!([self.screen.is_some(), self.window.is_some(), self.window_id.is_some(), self.app.is_some()].into_iter().filter(|v| *v).count() <= 1,
+            "use only one of --screen, --window, --window-id, --app");
+        ensure!(self.screen.as_deref().map(|s| s == "full").unwrap_or(true), "--screen only supports full");
+        for value in [&self.app, &self.window].into_iter().flatten() { ensure!(!value.trim().is_empty(), "capture target cannot be empty"); }
+        Ok(())
+    }
+    pub fn describe(&self) -> String {
+        if let Some(app) = &self.app { format!("app {app} (main display)") }
+        else if let Some(window) = &self.window { format!("window {window}") }
+        else if let Some(id) = self.window_id { format!("window ID {id}") }
+        else { "main display".into() }
+    }
+    fn allows_screenshot_fallback(&self) -> bool {
+        self.app.is_none() && self.window.is_none() && self.window_id.is_none() && !self.system_audio
+    }
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DaemonArgs {
+    pub run_id: String, pub title: Option<String>, pub workdir: PathBuf, pub output: PathBuf, pub capture: CaptureOptions,
+}
+struct ActiveTest { step: u32, owner_pid: u32, command: String }
 struct RunState {
-    run_id: String,
-    title: Option<String>,
-    output: PathBuf,
-    tmp_dir: PathBuf,
-    started: Instant,
-    step: u32,
-    checkpoints: u32,
-    events: Vec<RunEvent>,
-    action: Option<String>,
-    verdict: Option<String>,
-    git: GitInfo,
+    run_id: String, title: Option<String>, output: PathBuf, tmp_dir: PathBuf,
+    started: Instant, created_at: String, step: u32, checkpoints: u32, tests: u32,
+    events: Vec<RunEvent>, action: Option<String>, verdict: Option<String>, git: GitInfo,
+    active_test: Option<ActiveTest>, hold_until: Instant, finalizing: bool,
 }
-
 impl RunState {
-    fn next_step(
-        &mut self,
-        kind: EventKind,
-        text: String,
-        status: Option<ObserveStatus>,
-    ) -> RunEvent {
+    fn next_step(&mut self, kind: EventKind, text: String, status: Option<ObserveStatus>) -> RunEvent {
         self.step += 1;
-        if kind == EventKind::Checkpoint {
-            self.checkpoints += 1;
-        }
-        if kind == EventKind::Note || kind == EventKind::Checkpoint {
-            self.action = Some(text.clone());
-        }
-        if kind == EventKind::Observe {
-            if let Some(label) = status.and_then(|s| s.as_verdict_label()) {
-                self.verdict = Some(label.to_string());
-            } else if status == Some(ObserveStatus::Info) {
-                self.verdict = None;
-            }
-            self.action = Some(text.clone());
-        }
-        let event = RunEvent {
-            ts_ms: now_ms(),
-            step: self.step,
-            step_id: format_step_id(&self.run_id, self.step),
-            kind,
-            text,
-            status,
-        };
-        self.events.push(event.clone());
-        event
+        if kind == EventKind::Checkpoint { self.checkpoints += 1; }
+        if kind != EventKind::Expect { self.action = Some(crate::runner::display_text(&text, 110)); }
+        if kind == EventKind::Observe { self.verdict = status.and_then(|s| s.as_verdict_label()).map(String::from); }
+        if matches!(kind, EventKind::TestStart | EventKind::TestResult) { self.verdict = None; }
+        RunEvent { ts_ms: now_ms(), media_ms: self.started.elapsed().as_millis() as u64, step: self.step,
+            step_id: format_step_id(&self.run_id, self.step), kind, text, status, test_result: None }
+    }
+    fn response(&self) -> IpcResponse {
+        let s = self.started.elapsed().as_secs();
+        IpcResponse { ok: true, run_id: Some(self.run_id.clone()), step: Some(self.step),
+            step_id: Some(format_step_id(&self.run_id, self.step)), output: Some(self.output.display().to_string()),
+            duration: Some(format!("{:02}:{:02}", s / 60, s % 60)), steps: Some(self.step),
+            checkpoints: Some(self.checkpoints), tests: Some(self.tests), verdict: self.verdict.clone(), ..Default::default() }
     }
 }
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn format_duration(d: Duration) -> String {
-    let s = d.as_secs();
-    format!("{:02}:{:02}", s / 60, s % 60)
-}
-
+fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
 fn find_capture_bin() -> Result<PathBuf> {
-    if let Some(p) = std::env::var_os("REC_CAPTURE") {
-        return Ok(PathBuf::from(p));
+    if let Some(p) = std::env::var_os("REC_CAPTURE") { return Ok(PathBuf::from(p)); }
+    if let Some(dir) = std::env::current_exe()?.parent() {
+        let p = dir.join("rec-capture"); if p.is_file() { return Ok(p); }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("rec-capture");
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-        }
-    }
-    which("rec-capture").context("rec-capture not found on PATH")
+    let out = Command::new("which").arg("rec-capture").output()?;
+    ensure!(out.status.success(), "rec-capture not found on PATH");
+    Ok(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
 }
-
-fn which(name: &str) -> Result<PathBuf> {
-    let out = Command::new("which").arg(name).output()?;
-    if !out.status.success() {
-        bail!("{name} not found");
-    }
-    Ok(PathBuf::from(
-        String::from_utf8_lossy(&out.stdout).trim().to_string(),
-    ))
-}
-
-#[derive(Debug, Deserialize)]
-struct CaptureEvent {
-    event: String,
-    #[serde(default)]
-    message: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WindowInfo {
-    id: u32,
-    app: String,
-    #[serde(default)]
-    title: String,
-}
-
-fn capture_list_windows(bin: &Path) -> Result<Vec<WindowInfo>> {
-    let out = Command::new(bin)
-        .arg("list-windows")
-        .output()
-        .context("rec-capture list-windows")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        if err.contains("Screen Recording permission") || out.status.code() == Some(2) {
-            eprint!("{}", err);
-            std::process::exit(1);
-        }
-        bail!("list-windows failed: {err}");
-    }
-    Ok(serde_json::from_slice(&out.stdout).unwrap_or_default())
-}
-
+#[derive(Deserialize)]
+struct WindowInfo { id: u32, app: String, #[serde(default)] title: String }
 fn resolve_window(bin: &Path, query: &str) -> Result<u32> {
-    let windows = capture_list_windows(bin)?;
+    let out = Command::new(bin).arg("list-windows").output()?;
+    ensure!(out.status.success(), "list-windows failed: {}", String::from_utf8_lossy(&out.stderr));
+    let windows: Vec<WindowInfo> = serde_json::from_slice(&out.stdout).context("invalid window list")?;
     let q = query.to_lowercase();
-    let matches: Vec<&WindowInfo> = windows
-        .iter()
-        .filter(|w| w.title.to_lowercase().contains(&q) || w.app.to_lowercase().contains(&q))
-        .collect();
-    match matches.as_slice() {
-        [] => bail!("no window matching `{query}`"),
-        [one] => Ok(one.id),
-        many => {
-            let exact_title: Vec<&WindowInfo> = many
-                .iter()
-                .copied()
-                .filter(|w| w.title.to_lowercase() == q)
-                .collect();
-            if exact_title.len() == 1 {
-                return Ok(exact_title[0].id);
-            }
-            let exact_app: Vec<&WindowInfo> = many
-                .iter()
-                .copied()
-                .filter(|w| w.app.to_lowercase() == q)
-                .collect();
-            if !exact_app.is_empty() {
-                return Ok(exact_app[0].id);
-            }
-            eprintln!("multiple windows match `{query}`, using first:");
-            for w in many {
-                eprintln!("  {}  {} — {}", w.id, w.app, w.title);
-            }
-            Ok(many[0].id)
-        }
-    }
+    let matches: Vec<_> = windows.iter().filter(|w| w.title.to_lowercase().contains(&q) || w.app.to_lowercase().contains(&q)).collect();
+    if matches.len() == 1 { return Ok(matches[0].id); }
+    let exact: Vec<_> = matches.iter().filter(|w| w.title.to_lowercase() == q).collect();
+    if exact.len() == 1 { return Ok(exact[0].id); }
+    let options = matches.iter().map(|w| format!("{}: {} — {}", w.id, w.app, w.title)).collect::<Vec<_>>().join("\n");
+    bail!("window target is missing or ambiguous; select --window-id\n{options}")
 }
-
-struct CaptureProc {
-    child: Child,
-    stdin: ChildStdin,
-}
-
-enum CaptureBackend {
-    Sck(CaptureProc),
-    Cua(crate::cua::CuaGrabber),
-}
-
+#[derive(Deserialize)]
+struct CaptureEvent { event: String, message: Option<String>, #[serde(default)] elapsed_ms: u64 }
+struct CaptureProc { child: Child, stdin: ChildStdin, failure: Arc<Mutex<Option<String>>>, stopped: bool }
+enum CaptureBackend { Sck(CaptureProc), Cua(crate::cua::CuaGrabber) }
 impl CaptureBackend {
-    fn send(&mut self, hud: &CaptureHud) -> Result<()> {
-        match self {
-            CaptureBackend::Sck(p) => p.send(hud),
-            CaptureBackend::Cua(p) => p.send(hud),
+    fn health(&mut self) -> Result<()> {
+        if let Self::Sck(p) = self {
+            if let Some(error) = p.failure.lock().unwrap().clone() { bail!("capture failed: {error}"); }
+            if !p.stopped { ensure!(p.child.try_wait()?.is_none(), "capture process exited unexpectedly"); }
         }
-    }
-
-    fn stop(&mut self) -> Result<()> {
-        match self {
-            CaptureBackend::Sck(p) => p.stop(),
-            CaptureBackend::Cua(p) => p.stop(),
-        }
-    }
-}
-
-impl CaptureProc {
-    fn send(&mut self, hud: &CaptureHud) -> Result<()> {
-        serde_json::to_writer(&mut self.stdin, hud)?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
         Ok(())
     }
-
+    fn send(&mut self, hud: &CaptureHud) -> Result<()> {
+        self.health()?;
+        match self {
+            Self::Sck(p) => { serde_json::to_writer(&mut p.stdin, hud)?; p.stdin.write_all(b"\n")?; p.stdin.flush()?; Ok(()) }
+            Self::Cua(p) => p.send(hud),
+        }
+    }
     fn stop(&mut self) -> Result<()> {
-        let stop = CaptureHud {
-            cmd: "stop".into(),
-            step: None,
-            action: None,
-            verdict: None,
-            kind: None,
-            body: None,
-            title: None,
-            repository: None,
-            branch: None,
-            commit: None,
-            working_tree: None,
-        };
-        let _ = self.send(&stop);
-        Ok(())
+        match self {
+            Self::Cua(p) => p.stop(),
+            Self::Sck(p) => {
+                if p.stopped { return Ok(()); }
+                serde_json::to_writer(&mut p.stdin, &CaptureHud { cmd: "stop".into(), ..Default::default() })?;
+                p.stdin.write_all(b"\n")?; p.stdin.flush()?;
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    if let Some(status) = p.child.try_wait()? { ensure!(status.success(), "capture finalization failed: {status}"); p.stopped = true; break; }
+                    if Instant::now() >= deadline { let _ = p.child.kill(); let _ = p.child.wait(); bail!("capture finalization timed out; raw files retained"); }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if let Some(error) = p.failure.lock().unwrap().clone() { bail!("capture failed: {error}"); }
+                Ok(())
+            }
+        }
     }
 }
-
-fn hud_update(state: &RunState) -> CaptureHud {
-    CaptureHud {
-        cmd: "hud".into(),
-        step: Some(state.step),
-        action: state.action.clone(),
-        verdict: state.verdict.clone(),
-        kind: None,
-        body: None,
-        title: None,
-        repository: None,
-        branch: None,
-        commit: None,
-        working_tree: None,
-    }
+fn hud_update(s: &RunState) -> CaptureHud {
+    CaptureHud { cmd: "hud".into(), step: Some(s.step), action: s.action.clone(), verdict: s.verdict.clone(), ..Default::default() }
 }
-
-fn hud_card(kind: EventKind, body: &str, step: u32) -> CaptureHud {
-    CaptureHud {
-        cmd: "card".into(),
-        step: Some(step),
-        action: None,
-        verdict: None,
-        kind: Some(kind.as_card_title().into()),
-        body: Some(body.to_string()),
-        title: None,
-        repository: None,
-        branch: None,
-        commit: None,
-        working_tree: None,
-    }
+fn hud_git(s: &RunState) -> CaptureHud {
+    CaptureHud { cmd: "git".into(), step: Some(0), title: s.title.clone(), repository: s.git.repository.clone(),
+        branch: s.git.branch.clone(), commit: s.git.commit.clone(), working_tree: s.git.working_tree.clone(), ..Default::default() }
 }
-
-fn hud_git(state: &RunState) -> CaptureHud {
-    CaptureHud {
-        cmd: "git".into(),
-        step: Some(0),
-        action: None,
-        verdict: None,
-        kind: None,
-        body: None,
-        title: state.title.clone(),
-        repository: state.git.repository.clone(),
-        branch: state.git.branch.clone(),
-        commit: state.git.commit.clone(),
-        working_tree: state.git.working_tree.clone(),
-    }
-}
-
-fn spawn_capture(
-    bin: &Path,
-    raw_path: &Path,
-    run_id: &str,
-    screen: &Option<String>,
-    window: &Option<String>,
-    window_id: Option<u32>,
-) -> Result<CaptureProc> {
+fn spawn_capture(bin: &Path, raw: &Path, args: &DaemonArgs) -> Result<(CaptureProc, Instant)> {
+    args.capture.validate()?;
     let mut cmd = Command::new(bin);
-    cmd.arg("start")
-        .arg("--output")
-        .arg(raw_path)
-        .arg("--run-id")
-        .arg(run_id)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-
-    if let Some(id) = window_id {
-        cmd.arg("--window-id").arg(id.to_string());
-    } else if let Some(w) = window {
-        let id = resolve_window(bin, w)?;
-        cmd.arg("--window-id").arg(id.to_string());
-    } else {
-        let screen = screen.as_deref().unwrap_or("full");
-        if screen != "full" {
-            bail!("--screen only supports `full` in phase 1");
-        }
-        cmd.arg("--display").arg("main");
-    }
-
+    cmd.args(["start", "--output"]).arg(raw).args(["--run-id", &args.run_id]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+    if let Some(id) = args.capture.window_id { cmd.arg("--window-id").arg(id.to_string()); }
+    else if let Some(w) = &args.capture.window { cmd.arg("--window-id").arg(resolve_window(bin, w)?.to_string()); }
+    else if let Some(app) = &args.capture.app { cmd.arg("--app").arg(app); }
+    else { cmd.args(["--display", "main"]); }
+    if args.capture.system_audio { cmd.arg("--system-audio"); }
     let mut child = cmd.spawn().context("spawn rec-capture")?;
     let stdin = child.stdin.take().context("capture stdin")?;
     let stdout = child.stdout.take().context("capture stdout")?;
-
-    let ready = Arc::new(AtomicBool::new(false));
-    let failed = Arc::new(Mutex::new(None::<String>));
-    let ready2 = ready.clone();
-    let failed2 = failed.clone();
-
+    let failure = Arc::new(Mutex::new(None)); let errors = failure.clone();
+    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            if line.trim().is_empty() {
-                continue;
-            }
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             eprintln!("capture: {line}");
             if let Ok(ev) = serde_json::from_str::<CaptureEvent>(&line) {
-                match ev.event.as_str() {
-                    "ready" | "started" => ready2.store(true, Ordering::SeqCst),
-                    "error" => {
-                        *failed2.lock().unwrap() =
-                            Some(ev.message.unwrap_or_else(|| "capture error".into()));
-                    }
-                    "permission-denied" => {
-                        *failed2.lock().unwrap() = Some(
-                            "Screen Recording permission is required.\n\nSystem Settings >\nPrivacy & Security >\nScreen & System Audio Recording"
-                                .into(),
-                        );
-                    }
-                    _ => {}
+                if ev.event == "ready" { let _ = tx.send((ev.elapsed_ms, Instant::now())); }
+                if ev.event == "error" || ev.event == "permission-denied" {
+                    *errors.lock().unwrap() = Some(ev.message.unwrap_or_else(|| "Screen Recording permission is required".into()));
                 }
             }
         }
     });
-
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(18);
     loop {
-        if let Some(msg) = failed.lock().unwrap().clone() {
-            let _ = child.kill();
-            bail!("{msg}");
+        if let Ok((elapsed, received)) = rx.try_recv() {
+            let start = received.checked_sub(Duration::from_millis(elapsed)).unwrap_or(received);
+            return Ok((CaptureProc { child, stdin, failure, stopped: false }, start));
         }
-        if ready.load(Ordering::SeqCst) {
-            break;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            bail!("rec-capture did not become ready");
-        }
-        match child.try_wait()? {
-            Some(status) => bail!("rec-capture exited early: {status}"),
-            None => std::thread::sleep(Duration::from_millis(50)),
-        }
+        if let Some(e) = failure.lock().unwrap().clone() { let _ = child.kill(); let _ = child.wait(); bail!("{e}"); }
+        if let Some(status) = child.try_wait()? { bail!("rec-capture exited early: {status}"); }
+        if Instant::now() >= deadline { let _ = child.kill(); let _ = child.wait(); bail!("rec-capture did not produce a first frame"); }
+        std::thread::sleep(Duration::from_millis(10));
     }
-
-    Ok(CaptureProc { child, stdin })
 }
-
-fn append_event(path: &Path, event: &RunEvent) -> Result<()> {
-    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-    serde_json::to_writer(&mut f, event)?;
-    f.write_all(b"\n")?;
-    Ok(())
+fn record(state: &mut RunState, capture: &mut CaptureBackend, kind: EventKind, text: String, status: Option<ObserveStatus>, result: Option<TestResult>) -> Result<IpcResponse> {
+    ensure!(!state.finalizing, "recording is finalizing; retry rec stop instead of adding events");
+    capture.health()?;
+    let mut event = state.next_step(kind, text, status); event.test_result = result;
+    let mut f = OpenOptions::new().create(true).append(true).open(state.tmp_dir.join("events.jsonl"))?;
+    serde_json::to_writer(&mut f, &event)?; f.write_all(b"\n")?;
+    capture.send(&hud_update(state))?;
+    capture.send(&CaptureHud { cmd: "card".into(), step: Some(event.step), kind: Some(kind.as_card_title().into()), body: Some(event.text.clone()), ..Default::default() })?;
+    state.hold_until = Instant::now() + Duration::from_secs(4);
+    state.events.push(event);
+    let mut response = state.response(); response.kind = Some(kind.as_card_title().into());
+    if kind != EventKind::Observe { response.verdict = None; }
+    Ok(response)
 }
-
-fn handle_event(
-    state: &mut RunState,
-    capture: &mut CaptureBackend,
-    events_path: &Path,
-    kind: EventKind,
-    text: String,
-    status: Option<ObserveStatus>,
-) -> Result<IpcResponse> {
-    let event = state.next_step(kind, text, status);
-    append_event(events_path, &event)?;
-    let _ = capture.send(&hud_update(state));
-    let _ = capture.send(&hud_card(kind, &event.text, event.step));
-    let mut resp = IpcResponse {
-        ok: true,
-        error: None,
-        run_id: Some(state.run_id.clone()),
-        step: Some(event.step),
-        step_id: Some(event.step_id.clone()),
-        kind: Some(kind.as_card_title().into()),
-        output: None,
-        duration: None,
-        steps: None,
-        checkpoints: None,
-        verdict: None,
-    };
-    if kind == EventKind::Observe {
-        resp.verdict = status
-            .and_then(|s| s.as_verdict_label())
-            .map(|s| s.to_string());
+fn finish(state: &mut RunState, capture: &mut CaptureBackend, raw: &Path, audio: bool) -> Result<IpcResponse> {
+    ensure!(state.active_test.is_none(), "a test is still running; finish it before rec stop");
+    if !state.finalizing {
+        if let Some(wait) = state.hold_until.checked_duration_since(Instant::now()) { std::thread::sleep(wait); }
+        state.finalizing = true;
     }
-    Ok(resp)
-}
-
-fn finalize(
-    state: &RunState,
-    capture: &mut CaptureBackend,
-    raw_path: &Path,
-) -> Result<IpcResponse> {
     capture.stop()?;
-    if let CaptureBackend::Sck(p) = capture {
-        let timeout = Instant::now() + Duration::from_secs(30);
-        loop {
-            match p.child.try_wait()? {
-                Some(_) => break,
-                None if Instant::now() > timeout => {
-                    let _ = p.child.kill();
-                    break;
-                }
-                None => std::thread::sleep(Duration::from_millis(100)),
-            }
-        }
-    }
-
-    if let Some(parent) = state.output.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    if raw_path.exists() {
-        remux_mp4(raw_path, &state.output, state)?;
-    } else {
-        bail!("capture file missing: {}", raw_path.display());
-    }
-
-    let _ = fs::remove_dir_all(&state.tmp_dir);
-
-    Ok(IpcResponse {
-        ok: true,
-        error: None,
-        run_id: Some(state.run_id.clone()),
-        step: Some(state.step),
-        step_id: None,
-        kind: None,
-        output: Some(state.output.display().to_string()),
-        duration: Some(format_duration(state.started.elapsed())),
-        steps: Some(state.step),
-        checkpoints: Some(state.checkpoints),
-        verdict: state.verdict.clone(),
-    })
+    let info = crate::media::probe(raw)?; crate::media::validate(&info, audio)?;
+    let duration = crate::media::duration_ms(&info)?;
+    let chapters = crate::media::chapters(&state.events, duration);
+    let meta = state.tmp_dir.join("chapters.ffmetadata");
+    fs::write(&meta, crate::media::metadata(state.title.as_deref(), &state.run_id, state.git.commit.as_deref(), &state.created_at, &chapters))?;
+    if let Some(p) = state.output.parent() { fs::create_dir_all(p)?; }
+    crate::media::remux(raw, &state.output, &meta, &chapters, audio, &state.run_id)?;
+    let mut reply = state.response(); reply.duration = Some(format!("{:02}:{:02}", duration / 60000, duration / 1000 % 60));
+    fs::remove_dir_all(&state.tmp_dir)?;
+    Ok(reply)
 }
-
-fn remux_mp4(raw: &Path, output: &Path, state: &RunState) -> Result<()> {
-    let tmp_out = output.with_extension("tmp.mp4");
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
-        .arg(raw)
-        .args(["-c", "copy", "-movflags", "+faststart"]);
-    if let Some(title) = &state.title {
-        cmd.arg("-metadata").arg(format!("title={title}"));
+fn reap_test(state: &mut RunState, capture: &mut CaptureBackend) -> Result<()> {
+    if state.active_test.as_ref().map(|t| !session::pid_alive(t.owner_pid)).unwrap_or(false) {
+        let t = state.active_test.take().unwrap();
+        let result = TestResult { error: Some("test CLI exited before reporting a result; exit code unknown".into()), ..Default::default() };
+        record(state, capture, EventKind::TestResult, result.card_body(&t.command), None, Some(result))?;
     }
-    cmd.arg("-metadata")
-        .arg(format!("comment=runId={}", state.run_id));
-    if let Some(commit) = &state.git.commit {
-        cmd.arg("-metadata").arg(format!("synopsis=git {commit}"));
-    }
-    cmd.arg(&tmp_out);
-    let status = cmd.status().context("ffmpeg remux")?;
-    if status.success() && tmp_out.exists() {
-        fs::rename(&tmp_out, output)?;
-        return Ok(());
-    }
-    fs::copy(raw, output).context("copy raw capture")?;
     Ok(())
 }
-
-fn detach() {
-    extern "C" {
-        fn setsid() -> i32;
-    }
-    unsafe {
-        let _ = setsid();
+fn handle(req: IpcRequest, state: &mut RunState, capture: &mut CaptureBackend) -> Result<IpcResponse> {
+    match req {
+        IpcRequest::Note { text } => record(state, capture, EventKind::Note, text, None, None),
+        IpcRequest::Expect { text } => record(state, capture, EventKind::Expect, text, None, None),
+        IpcRequest::Observe { text, status } => record(state, capture, EventKind::Observe, text, status.or(Some(ObserveStatus::Info)), None),
+        IpcRequest::Checkpoint { text } => record(state, capture, EventKind::Checkpoint, text, None, None),
+        IpcRequest::Status => { capture.health()?; Ok(state.response()) }
+        IpcRequest::TestBegin { command, cwd, owner_pid } => {
+            ensure!(state.active_test.is_none(), "a test is already running");
+            ensure!(!command.is_empty() && !command[0].is_empty(), "test command is required");
+            ensure!(session::pid_alive(owner_pid), "test CLI is no longer running");
+            let label = crate::runner::command_label(&command);
+            let reply = record(state, capture, EventKind::TestStart, format!("Command: {label}\nCwd: {cwd}\nRunning (no verdict)"), None, None)?;
+            state.tests += 1;
+            state.active_test = Some(ActiveTest { step: state.step, owner_pid, command: label });
+            Ok(reply)
+        }
+        IpcRequest::TestEnd { run_id, test_step, result } => {
+            let active = state.active_test.as_ref().context("no matching active test")?;
+            ensure!(run_id == state.run_id && test_step == active.step, "test result belongs to a different run/test");
+            let body = result.card_body(&active.command);
+            let reply = record(state, capture, EventKind::TestResult, body, None, Some(result))?;
+            state.active_test = None; Ok(reply)
+        }
+        IpcRequest::Stop => bail!("internal stop dispatch error"),
     }
 }
 
 pub fn run(args: DaemonArgs) -> Result<()> {
-    detach();
-
-    let tmp_dir = session::run_tmp_dir(&args.run_id);
-    fs::create_dir_all(&tmp_dir)?;
-    let raw_path = tmp_dir.join("raw.mp4");
-    let events_path = tmp_dir.join("events.jsonl");
-    let sock_path = session::socket_path(&args.run_id);
-    let _ = fs::remove_file(&sock_path);
-
-    let git = GitInfo::collect(&args.workdir);
-    let mut state = RunState {
-        run_id: args.run_id.clone(),
-        title: args.title.clone(),
-        output: args.output.clone(),
-        tmp_dir: tmp_dir.clone(),
-        started: Instant::now(),
-        step: 0,
-        checkpoints: 0,
-        events: Vec::new(),
-        action: args.title.clone(),
-        verdict: None,
-        git,
-    };
-
-    write_json_atomic(
-        &tmp_dir.join("session.json"),
-        &serde_json::json!({
-            "runId": state.run_id,
-            "title": state.title,
-            "git": state.git,
-        }),
-    )?;
-
-    let capture_bin = find_capture_bin()?;
-    let mut capture = match spawn_capture(
-        &capture_bin,
-        &raw_path,
-        &state.run_id,
-        &args.screen,
-        &args.window,
-        args.window_id,
-    ) {
-        Ok(p) => CaptureBackend::Sck(p),
+    extern "C" { fn setsid() -> i32; fn flock(fd: i32, operation: i32) -> i32; }
+    unsafe { setsid(); }
+    args.capture.validate()?;
+    fs::create_dir_all(session::session_dir()?)?;
+    // Kernel-held lock prevents two simultaneous rec start processes from creating two runs.
+    let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(session::session_dir()?.join("run.lock"))?;
+    ensure!(unsafe { flock(lock.as_raw_fd(), 2 | 4) } == 0, "An active recording already exists.");
+    let tmp_dir = session::run_tmp_dir(&args.run_id); fs::create_dir_all(&tmp_dir)?;
+    let raw = tmp_dir.join("raw.mp4"); let sock = session::socket_path(&args.run_id);
+    let created = Command::new("date").args(["-u", "+%Y-%m-%dT%H:%M:%SZ"]).output().ok().map(|r| String::from_utf8_lossy(&r.stdout).trim().to_string()).unwrap_or_default();
+    let mut state = RunState { run_id: args.run_id.clone(), title: args.title.clone(), output: args.output.clone(), tmp_dir,
+        started: Instant::now(), created_at: created, step: 0, checkpoints: 0, tests: 0, events: Vec::new(),
+        action: args.title.clone(), verdict: None, git: GitInfo::collect(&args.workdir), active_test: None,
+        hold_until: Instant::now() + Duration::from_millis(4500), finalizing: false };
+    write_json_atomic(&state.tmp_dir.join("session.json"), &serde_json::json!({"runId":state.run_id,"title":state.title,"git":state.git,"capture":args.capture,"created_at":state.created_at}))?;
+    let bin = find_capture_bin()?;
+    let mut capture = match spawn_capture(&bin, &raw, &args) {
+        Ok((p, start)) => { state.started = start; CaptureBackend::Sck(p) }
         Err(e) => {
-            eprintln!("SCK capture unavailable: {e:#}");
-            if args.window.is_some() || args.window_id.is_some() {
-                let _ = fs::remove_dir_all(&tmp_dir);
-                bail!(
-                    "specific window capture failed; refusing full-screen screenshot fallback: {e:#}"
-                );
-            }
-            eprintln!("falling back to CuaDriver screenshots");
-            CaptureBackend::Cua(crate::cua::CuaGrabber::start(
-                &state.run_id,
-                &tmp_dir,
-                raw_path.clone(),
-                &capture_bin,
-                hud_git(&state),
-            )?)
+            ensure!(args.capture.allows_screenshot_fallback(), "native capture failed; refusing to expand scope or drop requested audio: {e:#}");
+            eprintln!("SCK unavailable: {e:#}; falling back to full-display screenshots (no audio)");
+            let p = crate::cua::CuaGrabber::start(&state.run_id, &state.tmp_dir, raw.clone(), &bin, hud_git(&state))?;
+            state.started = p.started(); CaptureBackend::Cua(p)
         }
     };
-
-    let _ = capture.send(&hud_git(&state));
-    let _ = capture.send(&hud_update(&state));
-
-    let listener =
-        UnixListener::bind(&sock_path).with_context(|| format!("bind {}", sock_path.display()))?;
-
-    let session = SessionFile {
-        run_id: state.run_id.clone(),
-        pid: std::process::id(),
-        socket: sock_path.display().to_string(),
-        workdir: args.workdir.display().to_string(),
-        output: args.output.display().to_string(),
-        title: args.title.clone(),
-    };
-    session::save_session(&session)?;
-
-    eprintln!("daemon ready run={}", state.run_id);
-
+    state.hold_until = Instant::now() + Duration::from_millis(4500);
+    capture.send(&hud_git(&state))?; capture.send(&hud_update(&state))?;
+    let _ = fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock)?; fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))?;
+    session::save_session(&SessionFile { run_id: state.run_id.clone(), pid: std::process::id(), socket: sock.display().to_string(), workdir: args.workdir.display().to_string(), output: state.output.display().to_string(), title: state.title.clone() })?;
     for incoming in listener.incoming() {
-        let stream = match incoming {
-            Ok(s) => s,
-            Err(_) => continue,
+        let stream = match incoming { Ok(s) => s, Err(_) => continue };
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let mut output = stream.try_clone()?;
+        let mut line = String::new();
+        if BufReader::new(stream).take(1_048_577).read_line(&mut line).is_err() || line.len() > 1_048_576 { continue; }
+        let request = serde_json::from_str::<IpcRequest>(line.trim());
+        let mut stopped = false;
+        let response = match request {
+            Ok(req) => (|| -> Result<IpcResponse> {
+                reap_test(&mut state, &mut capture)?;
+                if matches!(req, IpcRequest::Stop) {
+                    let r = finish(&mut state, &mut capture, &raw, args.capture.system_audio)?; stopped = true; Ok(r)
+                } else { handle(req, &mut state, &mut capture) }
+            })(),
+            Err(e) => Err(e.into()),
         };
-        let mut stream_out = match stream.try_clone() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let mut buf = String::new();
-        let mut reader = BufReader::new(stream);
-        if reader.read_line(&mut buf).is_err() {
-            continue;
-        }
-        let req: IpcRequest = match serde_json::from_str(buf.trim()) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = writeln!(
-                    stream_out,
-                    "{}",
-                    serde_json::to_string(&IpcResponse::err(e.to_string())).unwrap()
-                );
-                continue;
-            }
-        };
-        let resp = match req {
-            IpcRequest::Note { text } => handle_event(
-                &mut state,
-                &mut capture,
-                &events_path,
-                EventKind::Note,
-                text,
-                None,
-            ),
-            IpcRequest::Expect { text } => handle_event(
-                &mut state,
-                &mut capture,
-                &events_path,
-                EventKind::Expect,
-                text,
-                None,
-            ),
-            IpcRequest::Observe { text, status } => handle_event(
-                &mut state,
-                &mut capture,
-                &events_path,
-                EventKind::Observe,
-                text,
-                status.or(Some(ObserveStatus::Info)),
-            ),
-            IpcRequest::Checkpoint { text } => handle_event(
-                &mut state,
-                &mut capture,
-                &events_path,
-                EventKind::Checkpoint,
-                text,
-                None,
-            ),
-            IpcRequest::Status => Ok(IpcResponse {
-                ok: true,
-                error: None,
-                run_id: Some(state.run_id.clone()),
-                step: Some(state.step),
-                step_id: Some(format_step_id(&state.run_id, state.step)),
-                kind: None,
-                output: Some(state.output.display().to_string()),
-                duration: Some(format_duration(state.started.elapsed())),
-                steps: Some(state.step),
-                checkpoints: Some(state.checkpoints),
-                verdict: state.verdict.clone(),
-            }),
-            IpcRequest::Stop => match finalize(&state, &mut capture, &raw_path) {
-                Ok(r) => {
-                    let json = serde_json::to_string(&r)?;
-                    let _ = writeln!(stream_out, "{json}");
-                    let _ = session::clear_session();
-                    let _ = fs::remove_file(&sock_path);
-                    return Ok(());
-                }
-                Err(e) => Ok(IpcResponse::err(e.to_string())),
-            },
-        };
-        match resp {
-            Ok(r) => {
-                let _ = writeln!(stream_out, "{}", serde_json::to_string(&r).unwrap());
-            }
-            Err(e) => {
-                let _ = writeln!(
-                    stream_out,
-                    "{}",
-                    serde_json::to_string(&IpcResponse::err(e.to_string())).unwrap()
-                );
-            }
-        }
+        let response = response.unwrap_or_else(|e| IpcResponse::err(format!("{e:#}")));
+        let _ = writeln!(output, "{}", serde_json::to_string(&response)?);
+        if stopped { session::clear_session()?; let _ = fs::remove_file(&sock); return Ok(()); }
     }
     Ok(())
 }
 
-
 #[cfg(test)]
-mod phase1_contract_tests {
+mod tests {
     use super::*;
-
-    fn no_git() -> GitInfo {
-        GitInfo {
-            available: false,
-            repository: None,
-            root: None,
-            branch: None,
-            commit: None,
-            working_tree: None,
-            changed_files: None,
-        }
+    fn state() -> RunState {
+        RunState { run_id: "7F32".into(), title: None, output: PathBuf::new(), tmp_dir: PathBuf::new(), started: Instant::now(), created_at: String::new(), step: 0, checkpoints: 0, tests: 0, events: vec![], action: Some("Original action".into()), verdict: Some("Agent verdict: PASS".into()), git: GitInfo::collect(Path::new("/tmp")), active_test: None, hold_until: Instant::now(), finalizing: false }
     }
-
-    fn state_with_action(action: &str) -> RunState {
-        RunState {
-            run_id: "7F32".into(),
-            title: None,
-            output: PathBuf::from("/tmp/out.mp4"),
-            tmp_dir: PathBuf::from("/tmp/agent-recorder-test"),
-            started: Instant::now(),
-            step: 0,
-            checkpoints: 0,
-            events: Vec::new(),
-            action: Some(action.into()),
-            verdict: None,
-            git: no_git(),
-        }
-    }
-
     #[test]
-    fn expect_is_temporary_context_not_persistent_action() {
-        let mut state = state_with_action("Verify login error layout");
-        let event = state.next_step(
-            EventKind::Expect,
-            "Error should appear below the button".into(),
-            None,
-        );
-
-        assert_eq!(event.step_id, "7F32:001");
-        assert_eq!(state.action.as_deref(), Some("Verify login error layout"));
+    fn expect_preserves_action_but_test_clears_old_verdict() {
+        let mut s = state();
+        s.next_step(EventKind::Expect, "Expected result".into(), None);
+        assert_eq!(s.action.as_deref(), Some("Original action"));
+        s.next_step(EventKind::TestStart, "Command: true".into(), None);
+        assert!(s.verdict.is_none());
+        s.next_step(EventKind::TestResult, "Exit: 0".into(), None);
+        assert!(s.verdict.is_none()); assert_eq!(s.step, 3);
     }
-
     #[test]
-    fn note_updates_persistent_action() {
-        let mut state = state_with_action("Initial task");
-        state.next_step(EventKind::Note, "Adjust spacing".into(), None);
-
-        assert_eq!(state.action.as_deref(), Some("Adjust spacing"));
+    fn requested_audio_or_app_never_uses_screenshot_fallback() {
+        assert!(CaptureOptions::default().allows_screenshot_fallback());
+        assert!(!CaptureOptions { system_audio: true, ..Default::default() }.allows_screenshot_fallback());
+        assert!(!CaptureOptions { app: Some("Safari".into()), ..Default::default() }.allows_screenshot_fallback());
+        assert!(CaptureOptions { screen: Some("typo".into()), ..Default::default() }.validate().is_err());
     }
 }
