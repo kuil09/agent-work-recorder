@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct CuaGrabber {
     stop: Arc<AtomicBool>,
@@ -57,6 +57,13 @@ fn discover_cua() -> Result<CuaTarget> {
         }
     }
     bail!("no CuaDriver socket (Screen Recording fallback unavailable)")
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn cua_call(target: &CuaTarget, tool: &str, args: &serde_json::Value) -> Result<String> {
@@ -189,6 +196,14 @@ impl CuaGrabber {
             }
         } else {
             *cur = incoming;
+        }
+        if hud.cmd == "card" {
+            if let Some(obj) = cur.as_object_mut() {
+                obj.insert(
+                    "card_until_ms".into(),
+                    json!(now_unix_ms().saturating_add(4_000)),
+                );
+            }
         }
         Ok(())
     }

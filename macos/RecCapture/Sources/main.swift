@@ -441,14 +441,18 @@ func drawOverlay(size: NSSize, state: OverlayState) {
     let lineH: CGFloat = 26
 
     let hudId = String(format: "%@:%03u", state.runId, state.step)
-    let kind = state.cardKind
-    let eventBody = state.cardBody
+    let now = Date()
+    let cardVisible = state.cardUntil.map { $0 > now } ?? false
+    let gitVisible = state.gitUntil.map { $0 > now } ?? false
+    let kind = cardVisible ? state.cardKind : nil
+    let eventBody = cardVisible ? state.cardBody : nil
     let action = state.action
     let verdict = state.verdict
     let gitLine = gitOneLine(state)
     let lost = state.targetLost
 
-    var rows: CGFloat = 3
+    var rows: CGFloat = 2
+    if gitVisible { rows += 1 }
     if lost { rows += 1 }
     let barH = pad * 2 + rows * lineH + 4
     let bar = NSRect(x: 0, y: 0, width: size.width, height: barH)
@@ -515,11 +519,13 @@ func drawOverlay(size: NSSize, state: OverlayState) {
         )
     }
 
-    y += lineH
-    (truncate(gitLine, 120) as NSString).draw(
-        at: NSPoint(x: pad, y: y),
-        withAttributes: [.font: metaFont, .foregroundColor: NSColor(white: 0.8, alpha: 1)]
-    )
+    if gitVisible {
+        y += lineH
+        (truncate(gitLine, 120) as NSString).draw(
+            at: NSPoint(x: pad, y: y),
+            withAttributes: [.font: metaFont, .foregroundColor: NSColor(white: 0.8, alpha: 1)]
+        )
+    }
 
     if lost {
         y += lineH
@@ -626,6 +632,9 @@ func stampFrame(input: String, output: String, statePath: String?, runId: String
         if let v = obj["verdict"] as? String { overlay.verdict = v }
         if let k = obj["kind"] as? String { overlay.cardKind = k }
         if let b = obj["body"] as? String { overlay.cardBody = b }
+        if let until = obj["card_until_ms"] as? NSNumber {
+            overlay.cardUntil = Date(timeIntervalSince1970: until.doubleValue / 1000.0)
+        }
         if let t = obj["title"] as? String { overlay.gitTitle = t }
         if let r = obj["repository"] as? String { overlay.gitRepo = r }
         if let br = obj["branch"] as? String { overlay.gitBranch = br }

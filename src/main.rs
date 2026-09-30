@@ -194,7 +194,8 @@ fn start_run(
     if let Some(id) = window_id {
         cmd.arg("--window-id").arg(id.to_string());
     }
-    cmd.stdin(std::process::Stdio::null())
+    let mut daemon = cmd
+        .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
         .spawn()
@@ -208,6 +209,18 @@ fn start_run(
                 print_start_banner(&session, &title)?;
                 return Ok(());
             }
+        }
+        if let Some(status) = daemon.try_wait()? {
+            let tail = log_text
+                .lines()
+                .rev()
+                .take(20)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!("recorder daemon exited during startup ({status})\n{tail}");
         }
         if Instant::now() > deadline {
             let tail = log_text

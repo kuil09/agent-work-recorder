@@ -59,9 +59,6 @@ impl RunState {
             }
             self.action = Some(text.clone());
         }
-        if kind == EventKind::Expect {
-            self.action = Some(text.clone());
-        }
         let event = RunEvent {
             ts_ms: now_ms(),
             step: self.step,
@@ -535,6 +532,12 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         Ok(p) => CaptureBackend::Sck(p),
         Err(e) => {
             eprintln!("SCK capture unavailable: {e:#}");
+            if args.window.is_some() || args.window_id.is_some() {
+                let _ = fs::remove_dir_all(&tmp_dir);
+                bail!(
+                    "specific window capture failed; refusing full-screen screenshot fallback: {e:#}"
+                );
+            }
             eprintln!("falling back to CuaDriver screenshots");
             CaptureBackend::Cua(crate::cua::CuaGrabber::start(
                 &state.run_id,
@@ -660,4 +663,59 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod phase1_contract_tests {
+    use super::*;
+
+    fn no_git() -> GitInfo {
+        GitInfo {
+            available: false,
+            repository: None,
+            root: None,
+            branch: None,
+            commit: None,
+            working_tree: None,
+            changed_files: None,
+        }
+    }
+
+    fn state_with_action(action: &str) -> RunState {
+        RunState {
+            run_id: "7F32".into(),
+            title: None,
+            output: PathBuf::from("/tmp/out.mp4"),
+            tmp_dir: PathBuf::from("/tmp/agent-recorder-test"),
+            started: Instant::now(),
+            step: 0,
+            checkpoints: 0,
+            events: Vec::new(),
+            action: Some(action.into()),
+            verdict: None,
+            git: no_git(),
+        }
+    }
+
+    #[test]
+    fn expect_is_temporary_context_not_persistent_action() {
+        let mut state = state_with_action("Verify login error layout");
+        let event = state.next_step(
+            EventKind::Expect,
+            "Error should appear below the button".into(),
+            None,
+        );
+
+        assert_eq!(event.step_id, "7F32:001");
+        assert_eq!(state.action.as_deref(), Some("Verify login error layout"));
+    }
+
+    #[test]
+    fn note_updates_persistent_action() {
+        let mut state = state_with_action("Initial task");
+        state.next_step(EventKind::Note, "Adjust spacing".into(), None);
+
+        assert_eq!(state.action.as_deref(), Some("Adjust spacing"));
+    }
 }
