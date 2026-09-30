@@ -39,20 +39,7 @@ jobs:
           macos/RecCapture/.build/release/rec-capture self-test --output artifacts/synthetic-with-audio.mp4 --system-audio
           ffprobe -v error -show_streams -show_format -of json artifacts/synthetic-video-only.mp4 > artifacts/video-only.json
           ffprobe -v error -show_streams -show_format -of json artifacts/synthetic-with-audio.mp4 > artifacts/with-audio.json
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          for filename, audio in [('video-only.json', False), ('with-audio.json', True)]:
-              data = json.loads((Path('artifacts') / filename).read_text())
-              streams = data['streams']
-              assert any(s['codec_name'] == 'h264' for s in streams), data
-              sounds = [s for s in streams if s['codec_type'] == 'audio']
-              assert bool(sounds) == audio, data
-              if audio:
-                  assert sounds[0]['codec_name'] == 'aac', data
-                  assert abs(float(sounds[0]['duration']) - 1) < .1, data
-              assert abs(float(data['format']['duration']) - 1) < .1, data
-          PY
+          python3 tests/check_synthetic_media.py artifacts
       - name: CLI and daemon end-to-end scenarios (synthetic capture)
         run: |
           cargo build
