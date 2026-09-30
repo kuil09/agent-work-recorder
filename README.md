@@ -36,9 +36,14 @@ make install
 export PATH="$HOME/.local/bin:$PATH"
 
 rec --help
+rec --version             # source revision과 작업 소스 fingerprint
+rec-capture --version     # 바이너리 SHA-256과 일치하는 설치 manifest revision
 ```
 
 기본 설치 위치는 `~/.local/bin/rec`, `~/.local/bin/rec-capture`다. 다른 위치에는 `make install PREFIX=/your/prefix`로 설치한다. `ffmpeg`와 `ffprobe`는 런타임에도 PATH에 있어야 한다.
+
+설치 manifest는 같은 bin 디렉터리의 `agent-work-recorder-build.json`이다. 바이너리와 스킬을
+같은 수정본으로 맞추고 사용자 수정 사항을 보존하는 업데이트·검증 절차는 [스킬 설치 문서](skills/README.md)를 따른다.
 
 화면 녹화 권한은 실행하는 터미널 또는 에이전트에 부여한다.
 

@@ -3,13 +3,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rec::daemon::{CaptureOptions, DaemonArgs};
 use rec::protocol::{IpcRequest, IpcResponse, ObserveStatus};
 use rec::session::{self, SessionFile};
-use rec::{daemon, git, id, media, runner};
+use rec::{daemon, git, id, media, runner, startup};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 mod help;
@@ -21,7 +22,7 @@ mod help;
     long_about = help::OVERVIEW,
     after_help = "Use rec <COMMAND> --help for contracts, examples and failure handling.",
     after_long_help = help::OVERVIEW_DETAILS,
-    version
+    version = rec::build_info::VERSION
 )]
 struct Cli { #[command(subcommand)] command: Commands }
 
@@ -73,7 +74,7 @@ enum Commands {
     #[command(long_about = help::STOP, after_long_help = help::STOP_DETAILS)]
     Stop,
     #[command(hide = true)]
-    Daemon { #[arg(long)] config: PathBuf },
+    Daemon { #[arg(long)] config: PathBuf, #[arg(long)] startup_handshake: bool },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -116,6 +117,35 @@ fn log_tail(path: &std::path::Path) -> String {
     fs::read_to_string(path).unwrap_or_default().lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
 }
 
+fn startup_message(messages: &mpsc::Receiver<Result<startup::Message>>, deadline: Instant) -> Result<startup::Message> {
+    messages.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .context("recorder startup handshake timed out or disconnected")?
+}
+
+fn cancel_startup(child: &mut Child, control: &mut Option<ChildStdin>) -> String {
+    // Closing the inherited pipe lets the owning daemon stop its capture and
+    // roll back only its own startup resources. Never signal a PID from metadata.
+    drop(control.take());
+    let deadline = Instant::now() + Duration::from_secs(35);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return format!("startup child exited ({status}); any raw files retained for diagnosis"),
+            Err(error) => return format!("startup child status is unknown: {error}; preserve the Run and verify it from the authorized host"),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => break,
+        }
+    }
+    if let Err(error) = child.kill() {
+        return format!("could not terminate this startup child: {error}; it may still be recording; preserve the Run and verify its ownership from the authorized host");
+    }
+    // kill targets only the Child handle created by this invocation. Waiting
+    // after a successful kill reaps it; interrupted raw media may be incomplete.
+    match child.wait() {
+        Ok(status) => format!("startup child terminated ({status}); raw media may be incomplete"),
+        Err(error) => format!("startup child termination could not be confirmed: {error}; preserve the Run"),
+    }
+}
+
 fn start_run(title: Option<String>, capture: CaptureOptions, output: Option<PathBuf>) -> Result<()> {
     capture.validate()?;
     if let Some(existing) = session::load_session()? { bail!("An active recording already exists.\nRun: {}", existing.run_id); }
@@ -143,28 +173,66 @@ fn start_run(title: Option<String>, capture: CaptureOptions, output: Option<Path
     let log_dir = session::session_dir()?.join("logs"); fs::create_dir_all(&log_dir)?;
     fs::set_permissions(session::session_dir()?, fs::Permissions::from_mode(0o700))?;
     let log_path = log_dir.join(format!("{run_id}.log")); let log = fs::File::create(&log_path)?;
-    let mut child = Command::new(std::env::current_exe()?).arg("daemon").arg("--config").arg(&config)
-        .stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn().context("spawn recorder daemon")?;
+    let mut child = Command::new(std::env::current_exe()?).arg("daemon").arg("--config").arg(&config).arg("--startup-handshake")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(log).spawn().context("spawn recorder daemon")?;
+    let mut control = child.stdin.take();
+    let output = match child.stdout.take() {
+        Some(output) => output,
+        None => {
+            let cleanup = cancel_startup(&mut child, &mut control);
+            bail!("startup output pipe unavailable; Run: {run_id}; Log: {}; {cleanup}", log_path.display());
+        }
+    };
+    let (tx, messages) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut input = BufReader::new(output);
+        for _ in 0..3 {
+            let message = startup::read_json::<startup::Message>(&mut input);
+            let failed = message.is_err();
+            if tx.send(message).is_err() || failed { break; }
+        }
+    });
     let deadline = Instant::now() + Duration::from_secs(25);
-    loop {
-        if let Some(session) = session::load_session()? {
-            if session.run_id == run_id {
-                println!("REC\n\nRun        {run_id}\nTarget     {}\nAudio      {}", args.capture.describe(), if args.capture.system_audio { "system audio (no microphone)" } else { "OFF" });
-                if let Some(t) = &title { println!("Title      {t}"); }
-                let git = git::GitInfo::collect(std::path::Path::new(&session.workdir));
-                if git.available {
-                    println!("Repository {}\nBranch     {}\nCommit     {}\nWorking tree {}", git.repository.as_deref().unwrap_or("-"), git.branch.as_deref().unwrap_or("-"), git.commit.as_deref().unwrap_or("-"), git.working_tree.as_deref().unwrap_or("-"));
-                } else { println!("Git: unavailable"); }
-                println!("Output     {}", session.output); return Ok(());
+    let handshake = (|| -> Result<SessionFile> {
+        match startup_message(&messages, deadline)? {
+            startup::Message::Prepared { run_id: prepared, pid } => {
+                ensure!(prepared == run_id && pid == child.id(), "startup child identity mismatch");
+                session::verify_process_access(child.id())?;
             }
+            _ => bail!("expected prepared startup child"),
         }
-        if let Some(status) = child.try_wait()? { bail!("recorder daemon exited during startup ({status})\n{}", log_tail(&log_path)); }
-        if Instant::now() >= deadline {
-            let _ = child.kill(); let _ = child.wait();
-            bail!("recorder daemon failed to start\n{}", log_tail(&log_path));
+        let pipe = control.as_mut().context("startup control pipe")?;
+        startup::write_json(pipe, &startup::Command::Start)?;
+        let session = match startup_message(&messages, deadline)? {
+            startup::Message::Ready { session } => session,
+            _ => bail!("expected ready startup child"),
+        };
+        ensure!(session.run_id == run_id && session.pid == child.id()
+            && PathBuf::from(&session.socket) == session::socket_path(&run_id)
+            && PathBuf::from(&session.output) == args.output
+            && PathBuf::from(&session.workdir) == args.workdir, "startup Run identity mismatch");
+        startup::write_json(pipe, &startup::Command::Commit)?;
+        match startup_message(&messages, deadline)? {
+            startup::Message::Started { run_id: started } if started == run_id => Ok(session),
+            _ => bail!("expected committed startup Run"),
         }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    })();
+    let session = match handshake {
+        Ok(session) => session,
+        Err(error) => {
+            let cleanup = cancel_startup(&mut child, &mut control);
+            bail!("recorder startup failed: {error:#}\nRun: {run_id}\nDaemon PID: {}\nRun directory: {}\nLog: {}\n{cleanup}\n{}",
+                child.id(), tmp.display(), log_path.display(), log_tail(&log_path));
+        }
+    };
+    println!("REC\n\nRun        {run_id}\nTarget     {}\nAudio      {}", args.capture.describe(), if args.capture.system_audio { "system audio (no microphone)" } else { "OFF" });
+    println!("Recorder   {}", rec::build_info::VERSION);
+    if let Some(t) = &title { println!("Title      {t}"); }
+    let git = git::GitInfo::collect(std::path::Path::new(&session.workdir));
+    if git.available {
+        println!("Repository {}\nBranch     {}\nCommit     {}\nWorking tree {}", git.repository.as_deref().unwrap_or("-"), git.branch.as_deref().unwrap_or("-"), git.commit.as_deref().unwrap_or("-"), git.working_tree.as_deref().unwrap_or("-"));
+    } else { println!("Git: unavailable"); }
+    println!("Output     {}", session.output); Ok(())
 }
 
 fn test_run(command: Vec<String>, timeout_secs: u64) -> Result<i32> {
@@ -194,7 +262,7 @@ fn run() -> Result<i32> {
             let r = send_ipc(IpcRequest::Stop)?;
             println!("Recording complete\n\nDuration   {}\nSteps      {}\nCheckpoints {}\nTests      {}\n\n{}", r.duration.unwrap_or_default(), r.steps.unwrap_or(0), r.checkpoints.unwrap_or(0), r.tests.unwrap_or(0), r.output.unwrap_or_default());
         }
-        Commands::Daemon { config } => daemon::run(serde_json::from_slice(&fs::read(config)?)?)?,
+        Commands::Daemon { config, startup_handshake } => daemon::run(serde_json::from_slice(&fs::read(config)?)?, startup_handshake)?,
     }
     Ok(0)
 }

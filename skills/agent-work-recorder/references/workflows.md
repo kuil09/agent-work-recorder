@@ -3,6 +3,11 @@
 Read the installed command help first. These examples require permission and a selected,
 running capture target. Replace the sample app/project/check with the authorized task.
 Never run all target alternatives as consecutive `start` commands.
+Discovery and every recorder command below use the same authorized host context,
+user, HOME and TMPDIR. Select the host's approved execution route before starting;
+do not return to a restricted sandbox for note/test/stop. A rec test child inherits
+that route too. Checks that must remain sandboxed run there separately, with their
+results recorded honestly as notes/observations rather than a rec test result.
 
 ## Interactive agent task
 
@@ -34,7 +39,14 @@ automation. Check Run ownership before manual cleanup following an interruption.
 ```bash
 #!/bin/sh
 set -eu
-rec start --title "Project tests" --app com.apple.Terminal || exit 1
+start_rc=0
+rec start --title "Project tests" --app com.apple.Terminal || start_rc=$?
+if [ "$start_rc" -ne 0 ]; then
+    printf '%s\n' "Start failed: preserve the reported Run/log and inspect child cleanup before retrying" >&2
+    # If termination is unconfirmed, establish ownership in the approved host context.
+    # Do not issue an unconditional stop: an existing Run could belong to another task.
+    exit "$start_rc"
+fi
 
 test_rc=0
 rec test --timeout-secs 60 -- cargo test || test_rc=$?

@@ -85,6 +85,18 @@ fn probe_process(pid: u32) -> ProcessState {
     })
 }
 
+/// Before permitting a newly spawned daemon to capture, check that this caller
+/// can inspect it. This never changes session files or signals the process.
+pub fn verify_process_access(pid: u32) -> Result<()> {
+    match probe_process(pid) {
+        ProcessState::Running => Ok(()),
+        ProcessState::Exited => bail!("new recorder daemon PID {pid} exited before capture"),
+        ProcessState::Unknown(error) => Err(error).with_context(|| format!(
+            "cannot verify new recorder daemon PID {pid}; capture was not authorized to start. Use the same authorized host context for discovery and all rec commands; this is not a Screen Recording permission diagnosis"
+        )),
+    }
+}
+
 /// Read the session without unlinking or rewriting anything, even for ESRCH.
 /// Only the daemon's explicit lifecycle actions may change session resources.
 /// A PID check cannot prove socket ownership, and a restricted caller must not
@@ -131,7 +143,8 @@ pub fn save_session(session: &SessionFile) -> Result<()> {
     crate::id::write_json_atomic(&session_path()?, session)
 }
 
-/// Used by the owning daemon after explicit successful finalization, not lookup.
+/// Used by the owning daemon after finalization or rollback of its own published
+/// startup while holding the Run lock, never by session lookup.
 pub fn clear_session() -> Result<()> {
     clear_session_at(&session_path()?)
 }

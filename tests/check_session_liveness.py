@@ -9,6 +9,8 @@ import errno
 import json
 import os
 from pathlib import Path
+import select
+import socket
 import subprocess
 import sys
 import tempfile
@@ -34,7 +36,8 @@ static int injected_errno(pid_t pid, int sig) {
     long target = 0;
     int read = fscanf(file, "%ld", &target);
     fclose(file);
-    if (read != 1 || target != (long)pid) return 0;
+    // -1 is a test-only wildcard for the as-yet-unknown startup child PID.
+    if (read != 1 || (target != -1 && target != (long)pid)) return 0;
     int result = atoi(number);
     const char *trace = getenv("REC_LIVENESS_TEST_TRACE");
     if (trace) {
@@ -108,8 +111,120 @@ def main():
     binary = repo / 'target/debug/rec'
     assert binary.is_file(), 'run cargo build first'
     checks = []
+    skipped = []
     with tempfile.TemporaryDirectory(prefix='rec-s7-inject-') as temporary:
         library, loader = build_injector(Path(temporary))
+        h = Harness(binary)
+        try:
+            target = h.root / 'target-pid'
+            target.write_text('-1')
+            denied = invoke(h, fault_environment(h, library, loader, target, errno.EPERM),
+                            'start', '--window-id', '123', '--output', 'denied.mp4')
+            assert denied.returncode == 1, (denied.stdout, denied.stderr)
+            assert 'capture was not authorized to start' in denied.stderr
+            assert 'startup child exited' in denied.stderr
+            assert not h.trace.exists(), 'denied startup must not launch a capture helper'
+            assert not (h.home / '.agent-recorder/session').exists()
+            assert not (h.root / 'denied.mp4').exists()
+            probes = (h.root / 'native-probes.log').read_text().splitlines()
+            assert len(probes) == 1
+            daemon_pid = int(probes[0].split(':')[0])
+            try:
+                os.kill(daemon_pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise AssertionError('denied startup left its daemon alive')
+            h.call('start', '--window-id', '123', '--output', 'retry.mp4')
+            h.call('stop')
+            checks.append('new-child EPERM cancels startup before capture and permits a host retry')
+        finally:
+            h.close()
+
+        # Exercise both sides of the new-child handshake. The public CLI's
+        # inherited pipe closes on errors; the daemon must abort before commit.
+        stages = ['prepared', 'ready', 'socket-collision']
+        if os.geteuid() != 0:
+            stages.append('publication-denied')
+        else:
+            skipped.append('publication-denied requires an unprivileged filesystem user')
+        for stage in stages:
+            h = Harness(binary)
+            child = None
+            original_listener = None
+            try:
+                run_id = 'CA11'
+                config = h.root / 'startup.json'
+                config.write_text(json.dumps({
+                    'run_id': run_id, 'title': None, 'workdir': str(h.root),
+                    'output': str(h.root / 'cancelled.mp4'),
+                    'capture': {'window_id': 123, 'window': None, 'app': None,
+                                'screen': None, 'system_audio': False},
+                }))
+                child = subprocess.Popen([h.binary, 'daemon', '--config', str(config), '--startup-handshake'],
+                                         env=h.env, cwd=h.root, stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                assert select.select([child.stdout], [], [], 10)[0], 'prepared timed out'
+                assert json.loads(child.stdout.readline())['startup'] == 'prepared'
+                endpoint = h.tmp / f'agent-recorder-{run_id}.sock'
+                if stage == 'socket-collision':
+                    original_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    original_listener.bind(str(endpoint)); original_listener.listen(1)
+                    original_inode = endpoint.lstat().st_ino
+                if stage != 'prepared':
+                    child.stdin.write('"start"\n'); child.stdin.flush()
+                    assert select.select([child.stdout], [], [], 10)[0], 'ready timed out'
+                    message = child.stdout.readline()
+                    if stage == 'socket-collision':
+                        assert message == '', message
+                    else:
+                        ready = json.loads(message)
+                        assert ready['startup'] == 'ready'
+                        assert ready['session']['pid'] == child.pid
+                    assert not (h.home / '.agent-recorder/session').exists(), 'published before commit'
+                stale = None
+                if stage == 'publication-denied':
+                    stale = json.dumps({'run_id': '0BAD', 'pid': 2147483647,
+                        'socket': str(h.root / 'old.sock'), 'workdir': str(h.root),
+                        'output': str(h.root / 'old.mp4'), 'title': None}).encode()
+                    (h.home / '.agent-recorder/session').write_bytes(stale)
+                    (h.home / '.agent-recorder').chmod(0o500)
+                    child.stdin.write('"commit"\n'); child.stdin.flush()
+                child.stdin.close(); child.stdin = None
+                stdout, stderr = child.communicate(timeout=40)
+                assert child.returncode == 1, (stdout, stderr)
+                if stale is None:
+                    assert not (h.home / '.agent-recorder/session').exists()
+                else:
+                    assert (h.home / '.agent-recorder/session').read_bytes() == stale
+                    assert 'startup not committed' in stderr
+                    (h.home / '.agent-recorder').chmod(0o700)
+                if stage == 'socket-collision':
+                    assert endpoint.lstat().st_ino == original_inode
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                        client.connect(str(endpoint))
+                        accepted, _ = original_listener.accept(); accepted.close()
+                    original_listener.close(); original_listener = None
+                    endpoint.unlink()
+                else:
+                    assert not endpoint.exists()
+                assert not (h.root / 'cancelled.mp4').exists()
+                if stage == 'prepared':
+                    assert not h.trace.exists()
+                else:
+                    assert (h.tmp / 'agent-recorder' / run_id / 'raw.mp4').exists()
+                h.call('start', '--window-id', '123', '--output', 'after-cancel.mp4')
+                h.call('stop')
+                checks.append(f'startup failure at {stage} stops capture, preserves prior metadata and releases the Run lock')
+            finally:
+                if child is not None and child.poll() is None:
+                    child.kill(); child.wait(timeout=5)
+                if original_listener is not None:
+                    original_listener.close()
+                if (h.home / '.agent-recorder').exists():
+                    (h.home / '.agent-recorder').chmod(0o700)
+                h.close()
+
         h = Harness(binary)
         try:
             h.call('start', '--window-id', '123', '--output', 'review.mp4')
@@ -209,6 +324,7 @@ def main():
     evidence.mkdir(exist_ok=True)
     (evidence / 'session-liveness-report.json').write_text(json.dumps({
         'passed': checks,
+        'skipped': skipped,
         'faults': 'native kill(pid, 0) errno injection in isolated test processes',
         'capture': 'synthetic helper; real CLI, daemon and FFmpeg finalization',
         'live_sandbox_tested': False,

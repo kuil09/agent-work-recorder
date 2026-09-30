@@ -60,11 +60,19 @@ fn every_help_route_is_read_only_and_requires_no_capture_dependencies() {
 }
 
 #[test]
+fn version_identifies_working_source_without_session_side_effects() {
+    let s = Sandbox::new();
+    contains_all(&s.help(&["--version"]), &["rec 0.1.0", "revision", "source"]);
+    s.assert_untouched();
+}
+
+#[test]
 fn root_help_explains_discovery_ownership_claims_and_output() {
     let s = Sandbox::new(); let help = s.help(&["--help"]);
     contains_all(&help, &["AGENT WORKFLOW", "claims, not truth", "command exit 0", "HOME", "TMPDIR",
         "OUTPUT AND EXIT STATUS", "not a stable JSON API", "No --json", "SAFETY AND LIMITS",
         "SKILL.md", "rec <COMMAND> --help"]);
+    contains_all(&help, &["same authorized host context", "ALL rec commands", "execution context"]);
     assert!(!help.lines().any(|l| l.trim_start().starts_with("daemon ")));
     s.assert_untouched();
 }
@@ -75,6 +83,8 @@ fn start_help_documents_every_option_and_capture_privacy_boundary() {
     contains_all(&help, &["--title", "--output", "--screen", "--window", "--window-id", "--app",
         "--system-audio", "main display", "OTHER windows", "Default OFF", "never overwritten",
         "rec-capture list-windows", "rec-capture list-apps", "ON SUCCESS", "ON FAILURE"]);
+    contains_all(&help, &["rec-capture diagnose", "PID probe denied", "termination is unconfirmed",
+        "ALL rec commands", "confirmed Screen Recording denial"]);
 }
 
 #[test]
@@ -137,4 +147,6 @@ fn skill_metadata_and_references_form_a_portable_package() {
     contains_all(&skill, &["installed CLI", "does not authorize", "Only continue if start succeeds",
         "same user, HOME and TMPDIR", "owning-app audio", "Do not blindly rerun",
         "actual video", "synthetic", "new Run", "Human acceptance"]);
+    contains_all(&skill, &["all** `rec` commands", "matching sandbox policy", "child also inherits",
+        "cleanup is unconfirmed", "BUILD.json"]);
 }

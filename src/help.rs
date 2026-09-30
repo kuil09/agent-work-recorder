@@ -16,6 +16,9 @@ PRECONDITIONS AND LIFECYCLE
   permission for the terminal/agent host. Help and version need none of these.
   Only one Run is active for the shared HOME session. start does not toggle recording.
   Other commands require that Run; use the same user, HOME and TMPDIR across calls.
+  Use the same authorized host context for discovery and ALL rec commands, including
+  note, test and stop. Matching HOME/TMPDIR alone does not match sandbox restrictions.
+  rec test's child inherits that execution context; host execution includes the child.
   Do not stop, annotate or delete another task's session. Do not use daemon directly.
 
 OUTPUT AND EXIT STATUS
@@ -56,6 +59,9 @@ TARGET DISCOVERY
   rec-capture list-displays     JSON display IDs; rec currently uses the main display
   Window IDs are runtime identifiers: discover them again after windows reopen.
   A missing/ambiguous target is an error, not permission to record a wider scope.
+  Use the same authorized host context for discovery and ALL rec commands.
+  Compare approved host execution when sandboxed access fails; do not reset TCC
+  permissions based only on a false capture preflight or a denied PID probe.
 
 ON SUCCESS
   Save the printed Run ID and Output path for later review. Audio OFF is the default.
@@ -66,8 +72,14 @@ ON SUCCESS
 
 ON FAILURE
   An active Run: identify its owner; do not stop it merely to make start succeed.
-  Permission denied: arrange permission in System Settings > Privacy & Security,
-  then relaunch the terminal/agent host. Never bypass the OS permission boundary.
+  PID probe denied: startup cancels its own child before capture. This is separate
+  from Screen Recording permission. Preserve the Run/log paths printed on error.
+  Capture access unavailable: use rec-capture diagnose in the same approved context.
+  Only a confirmed Screen Recording denial calls for checking the responsible app's
+  access in System Settings > Privacy & Security and relaunching that app.
+  A startup error reports child cleanup; if termination is unconfirmed, a Run may
+  remain active. Verify ownership from the approved host before retrying or stopping.
+  Startup cancellation retains any raw files; it does not publish a completed MP4.
   Missing tools: ensure rec-capture, ffmpeg and ffprobe are installed and on PATH.
   Requested window/app/audio never falls back to full-screen or silent screenshots.
   Only full-display, video-only capture may use an already available CuaDriver fallback.
@@ -153,6 +165,10 @@ ARGUMENT BOUNDARY
   never interpolate untrusted content into shell code.
 
 LIFECYCLE AND OUTPUT
+  Use the same authorized host context as start. The child inherits that execution
+  context too; authorize host execution for the entire command. Checks that must
+  stay sandboxed run there separately and may be described with note/observe as
+  manual evidence, not a mechanically recorded rec test result.
   One counted test creates two Steps: start and result. Only start adds a chapter.
   Both events clear the old agent verdict. Judge actual evidence with observe later.
   Default timeout is 300 seconds. Timeout/interrupt terminates the test process group.

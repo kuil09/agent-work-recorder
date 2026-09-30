@@ -2,6 +2,7 @@ use crate::git::GitInfo;
 use crate::id::{format_step_id, write_json_atomic};
 use crate::protocol::{CaptureHud, EventKind, IpcRequest, IpcResponse, ObserveStatus, RunEvent, TestResult};
 use crate::session::{self, SessionFile};
+use crate::startup;
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -258,14 +259,24 @@ fn handle(req: IpcRequest, state: &mut RunState, capture: &mut CaptureBackend) -
     }
 }
 
-pub fn run(args: DaemonArgs) -> Result<()> {
+pub fn run(args: DaemonArgs, startup_handshake: bool) -> Result<()> {
     extern "C" { fn setsid() -> i32; fn flock(fd: i32, operation: i32) -> i32; }
     unsafe { setsid(); }
+    eprintln!("Recorder build: {}", crate::build_info::VERSION);
     args.capture.validate()?;
     fs::create_dir_all(session::session_dir()?)?;
     // Kernel-held lock prevents two simultaneous rec start processes from creating two runs.
     let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(session::session_dir()?.join("run.lock"))?;
     ensure!(unsafe { flock(lock.as_raw_fd(), 2 | 4) } == 0, "An active recording already exists.");
+    let mut startup_input = startup_handshake.then(|| BufReader::new(std::io::stdin()));
+    if let Some(input) = &mut startup_input {
+        startup::write_json(&mut std::io::stdout(), &startup::Message::Prepared {
+            run_id: args.run_id.clone(), pid: std::process::id(),
+        })?;
+        // No helper is launched until the originating CLI has verified access
+        // to its own child. EOF here releases the lock without starting capture.
+        startup::expect(input, startup::Command::Start)?;
+    }
     let tmp_dir = session::run_tmp_dir(&args.run_id); fs::create_dir_all(&tmp_dir)?;
     let raw = tmp_dir.join("raw.mp4"); let sock = session::socket_path(&args.run_id);
     let created = Command::new("date").args(["-u", "+%Y-%m-%dT%H:%M:%SZ"]).output().ok().map(|r| String::from_utf8_lossy(&r.stdout).trim().to_string()).unwrap_or_default();
@@ -273,8 +284,9 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         started: Instant::now(), created_at: created, step: 0, checkpoints: 0, tests: 0, events: Vec::new(),
         action: args.title.clone(), verdict: None, git: GitInfo::collect(&args.workdir), active_test: None,
         hold_until: Instant::now() + Duration::from_millis(4500), finalizing: false };
-    write_json_atomic(&state.tmp_dir.join("session.json"), &serde_json::json!({"runId":state.run_id,"title":state.title,"git":state.git,"capture":args.capture,"created_at":state.created_at}))?;
     let bin = find_capture_bin()?;
+    eprintln!("Capture helper: {}", bin.display());
+    write_json_atomic(&state.tmp_dir.join("session.json"), &serde_json::json!({"runId":state.run_id,"title":state.title,"git":state.git,"capture":args.capture,"created_at":state.created_at,"recorder_version":crate::build_info::VERSION,"capture_helper":bin}))?;
     let mut capture = match spawn_capture(&bin, &raw, &args) {
         Ok((p, start)) => { state.started = start; CaptureBackend::Sck(p) }
         Err(e) => {
@@ -285,10 +297,46 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         }
     };
     state.hold_until = Instant::now() + Duration::from_millis(4500);
-    capture.send(&hud_git(&state))?; capture.send(&hud_update(&state))?;
-    let _ = fs::remove_file(&sock);
-    let listener = UnixListener::bind(&sock)?; fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))?;
-    session::save_session(&SessionFile { run_id: state.run_id.clone(), pid: std::process::id(), socket: sock.display().to_string(), workdir: args.workdir.display().to_string(), output: state.output.display().to_string(), title: state.title.clone() })?;
+    let mut bound = false;
+    let mut published = false;
+    let initialize = (|| -> Result<UnixListener> {
+        capture.send(&hud_git(&state))?; capture.send(&hud_update(&state))?;
+        // A reserved Run directory does not establish ownership of an existing
+        // socket pathname. Fail on a collision instead of unlinking it.
+        let listener = UnixListener::bind(&sock)?;
+        bound = true;
+        fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))?;
+        let session = SessionFile { run_id: state.run_id.clone(), pid: std::process::id(),
+            socket: sock.display().to_string(), workdir: args.workdir.display().to_string(),
+            output: state.output.display().to_string(), title: state.title.clone() };
+        if let Some(input) = &mut startup_input {
+            startup::write_json(&mut std::io::stdout(), &startup::Message::Ready { session: session.clone() })?;
+            startup::expect(input, startup::Command::Commit)?;
+        }
+        session::save_session(&session)?;
+        published = true;
+        if startup_handshake {
+            startup::write_json(&mut std::io::stdout(), &startup::Message::Started { run_id: state.run_id.clone() })?;
+        }
+        Ok(listener)
+    })();
+    let listener = match initialize {
+        Ok(listener) => listener,
+        Err(error) => {
+            // The kernel lock is still held. Only this attempt's published
+            // session and successfully bound endpoint may be removed.
+            let mut cleanup = Vec::new();
+            if let Err(e) = capture.stop() { cleanup.push(format!("capture stop: {e:#}")); }
+            if published {
+                if let Err(e) = session::clear_session() { cleanup.push(format!("session cleanup: {e:#}")); }
+            }
+            if bound {
+                if let Err(e) = fs::remove_file(&sock) { cleanup.push(format!("socket cleanup: {e}")); }
+            }
+            bail!("startup not committed; Run {} raw files retained: {error:#}{}", state.run_id,
+                if cleanup.is_empty() { String::new() } else { format!("; cleanup incomplete: {}", cleanup.join("; ")) });
+        }
+    };
     for incoming in listener.incoming() {
         let stream = match incoming { Ok(s) => s, Err(_) => continue };
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;

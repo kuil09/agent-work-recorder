@@ -28,7 +28,19 @@ installed CLI over remembered flags. Do not invent `--json`, `--run-id`, `rec st
 Recording needs `rec-capture`, `ffmpeg`, `ffprobe` and Screen Recording permission.
 Help itself needs none of those and does not touch the session. Check dependencies
 without starting a recording. Keep the same user, HOME and TMPDIR across calls.
+Use the same authorized host context for discovery and **all** `rec` commands,
+including `note`, `test`, and `stop`. Matching user/HOME/TMPDIR does not establish
+matching sandbox policy. If a restricted invocation fails, compare the host-approved
+execution route in the same logged-in desktop session; a false preflight or PID probe
+denial is not proof of missing Screen Recording permission. Do not reset TCC on that
+evidence alone. The helper's supervisor inherits restrictions.
 Do not bypass OS permissions or alter another task's session/lock to proceed.
+
+Record `command -v rec`, `rec --version`, `command -v rec-capture`, and
+`rec-capture --version`. Compare the installed skill's `BUILD.json` with the installation
+manifest as described in the source repository's `skills/README.md`. The CLI version
+includes its source revision/fingerprint; helper versions include a binary SHA-256 and
+verified installation revision when available. A package version alone is insufficient.
 
 ## 2. Select and disclose the capture boundary
 
@@ -57,6 +69,13 @@ Run ID, target, audio setting, Git context and output path in your task context.
 Only continue if start succeeds. If another Run is active, identify its owner before
 acting. Never stop or annotate it merely to make your workflow succeed. The daemon
 outlives the starting shell. Only stop a Run you own or are explicitly asked to stop.
+
+Start verifies access to its new daemon before launching capture, then waits for a
+private readiness/commit handshake. On failure it closes that startup channel and
+reports cleanup of its own child plus Run/log paths. Preserve these diagnostics.
+If cleanup is unconfirmed, treat the Run as potentially active and establish ownership
+in the approved host context before retrying or stopping. Older binaries may leave a
+daemon running after a failed start; do not assume exit 1 proves there is no capture.
 
 Git context describes start time, not later edits or exact build provenance. Record a
 later code/build change explicitly when relevant; do not imply that the starting commit
@@ -87,6 +106,11 @@ The command uses this caller's cwd/environment, receives closed stdin, and runs 
 an implicit shell. Put recorder options before COMMAND. Tokens after the executable,
 including `--help`, belong to the child. Use explicit `sh -c` only for trusted shell syntax;
 never interpolate untrusted text into shell code. This is not a command sandbox.
+The child also inherits the caller's execution context. Running `rec test` through an
+approved host route runs its child there too; authorize the entire command accordingly.
+If the work must stay in the sandbox, run the check there directly and record its actual
+command/result through host-context notes and observations. That manual record is an
+agent claim, not a mechanically captured `rec test` result.
 
 One test creates a start Step and a result Step but is counted once. Only test start
 creates a chapter boundary. Both events clear the old agent verdict. A test preserves

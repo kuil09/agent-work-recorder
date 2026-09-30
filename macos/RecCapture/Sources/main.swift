@@ -235,6 +235,7 @@ Usage:
   rec-capture start --output FILE [--app NAME|BUNDLE | --window-id ID | --display main] [--system-audio]
   rec-capture list-windows | list-apps | list-displays
   rec-capture diagnose [--window-id ID]
+  rec-capture --version
 
 Use an authorized interactive macOS desktop session for discovery AND recording.
 A sandbox/TCC-attribution restriction is not proof of missing Screen Recording permission.
@@ -255,6 +256,10 @@ See docs/macos-capture-diagnostics.md for the minimal reproducer and acceptance 
 func main() throws {
     var values = Array(CommandLine.arguments.dropFirst())
     if values == ["--help"] || values == ["-h"] { print(helperHelp); return }
+    if values == ["--version"] {
+        guard let executable = Bundle.main.executableURL else { throw RecorderError("helper executable unavailable") }
+        print(try HelperBuildInfo.version(executable: executable)); return
+    }
     guard !values.isEmpty else { throw RecorderError(helperHelp) }
     let isWorker = values.first == CaptureSupervisor.workerCommand
     if isWorker { values.removeFirst(); try CaptureWorkerLifetime.start() }

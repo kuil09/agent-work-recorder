@@ -41,6 +41,18 @@ No production environment variable can override the PID check.
 
 ## A restricted command failed, but the endpoint still exists
 
+New starts use an inherited-pipe handshake with the child spawned by that exact CLI.
+After the daemon takes the Run lock, the CLI verifies PID access before permitting
+capture. Readiness carries the expected Run/PID/socket/output; publication waits for
+the caller's commit. Disconnects before commit stop the startup capture and remove
+only that attempt's bound socket. Any raw media and diagnostics are retained.
+
+The CLI reports its startup child's cleanup outcome and Run/log paths on failure.
+An unconfirmed termination remains potentially active; verify ownership in the
+authorized context before retrying or stopping it. This does not recover an older
+Run whose socket was already unlinked. A successful start still requires all later
+rec commands to use the same approved execution context.
+
 Stop issuing recording commands from the restricted execution context. Use the
 same authorized host context as `rec start`, with the same HOME/TMPDIR and helper
 installation. This means a host-approved invocation, not a sandbox escape, TCC reset,
@@ -184,7 +196,8 @@ reason to preserve files for manual review, not to broaden cleanup.
 `cargo test --all-targets` includes native PID validation and deterministic injected
 errno tests with real Unix listener paths and unchanged session/socket inode checks.
 `python3 tests/check_session_liveness.py` uses a test-only dynamic library to inject
-EPERM/EACCES/EIO/ESRCH into real CLI processes. It checks denied note/start/stop,
+EPERM/EACCES/EIO/ESRCH into real CLI processes. It checks new-child EPERM before
+capture, caller disconnect at prepared/ready stages, denied note/start/stop,
 subsequent host connectivity and finalization, plus denied test-owner inspection in
 the daemon. All sessions use isolated HOME/TMPDIR and synthetic capture.
 

@@ -8,6 +8,7 @@ application behavior. None automatically implies the others. Read stderr before 
 | Unknown command/flag or usage error (2) | Read the installed `rec <COMMAND> --help`; fix argv ordering | Invent `status`, `cancel`, `--json` or `--run-id` |
 | No active recording | Start an authorized Run first, unless the task is only help/inspection; preserve any stale evidence | Assume note/test implicitly starts capture or lookup cleaned up old files |
 | An active recording already exists | Identify who owns it; use it only with authorization | Kill it or remove its session/lock to make room |
+| Startup failed / child cleanup unconfirmed | Preserve Run/PID/log paths; confirm ownership and state in the approved host context before retrying | Infer no capture exists from exit 1 or stop a different Run |
 | Cannot verify recording / PID probe denied | Use the same authorized host context as start; preserve session, socket and raw media | Treat EPERM as a dead process, reset Screen Recording permissions, or remove the socket |
 | Socket pathname missing but daemon still alive | Preserve the Run and follow the verified-process recovery procedure below | Recreate the pathname, start another Run, kill unrelated processes, or claim reinstallation restores connectivity |
 | Missing/ambiguous window | Inspect `rec-capture list-windows` in the approved capture context; select a current numeric ID | Record the app/desktop as an unapproved substitute |
@@ -32,6 +33,8 @@ Check the installed helper's help first; older builds may not have `diagnose`.
 
 ```bash
 rec-capture --help
+rec --version
+rec-capture --version
 rec-capture diagnose
 rec-capture diagnose --window-id 1455
 ```

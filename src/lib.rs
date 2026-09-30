@@ -1,3 +1,4 @@
+pub mod build_info;
 pub mod cua;
 pub mod daemon;
 pub mod git;
@@ -6,3 +7,4 @@ pub mod media;
 pub mod protocol;
 pub mod runner;
 pub mod session;
+pub mod startup;

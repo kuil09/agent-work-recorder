@@ -46,6 +46,13 @@ jobs:
         run: |
           cargo build
           python3 tests/e2e.py
+      - name: Build and skill identity checks (no live capture)
+        run: |
+          cargo run --locked -- --version
+          macos/RecCapture/.build/release/rec-capture --version
+          python3 tools/package_info.py skill
+          python3 tests/check_package_info.py
+          python3 tools/package_info.py manifest --rec target/debug/rec --helper macos/RecCapture/.build/release/rec-capture --output artifacts/build-info.json
       - name: Session lookup with native PID permission faults (issue 7)
         run: python3 tests/check_session_liveness.py
       - name: Upload synthetic media evidence
