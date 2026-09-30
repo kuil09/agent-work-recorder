@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: macos-latest
@@ -49,6 +53,10 @@ jobs:
                   assert abs(float(sounds[0]['duration']) - 1) < .1, data
               assert abs(float(data['format']['duration']) - 1) < .1, data
           PY
+      - name: CLI and daemon end-to-end scenarios (synthetic capture)
+        run: |
+          cargo build
+          python3 tests/e2e.py
       - name: Upload synthetic media evidence
         if: always()
         uses: actions/upload-artifact@v4
