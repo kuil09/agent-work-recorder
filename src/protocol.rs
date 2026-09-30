@@ -138,13 +138,20 @@ pub enum IpcRequest {
         command: Vec<String>,
         cwd: String,
         owner_pid: u32,
+        /// Client-side timeout; the daemon derives a deadline from it. 0 = unknown (old client).
+        #[serde(default)]
+        timeout_secs: u64,
     },
     TestEnd {
         run_id: String,
         test_step: u32,
         result: TestResult,
     },
-    Stop,
+    Stop {
+        /// Close a still-running test as "result unknown" before stopping.
+        #[serde(default)]
+        abandon_test: bool,
+    },
     Status,
 }
 
@@ -173,6 +180,10 @@ pub struct IpcResponse {
     pub tests: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_test: Option<String>,
 }
 impl IpcResponse {
     pub fn err(msg: impl Into<String>) -> Self {

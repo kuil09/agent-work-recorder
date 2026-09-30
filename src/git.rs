@@ -14,18 +14,22 @@ pub struct GitInfo {
 }
 
 impl GitInfo {
+    pub fn unavailable() -> Self {
+        GitInfo {
+            available: false,
+            repository: None,
+            root: None,
+            branch: None,
+            commit: None,
+            working_tree: None,
+            changed_files: None,
+        }
+    }
+
     pub fn collect(cwd: &Path) -> Self {
         let root = git_output(cwd, &["rev-parse", "--show-toplevel"]);
         let Some(root) = root else {
-            return GitInfo {
-                available: false,
-                repository: None,
-                root: None,
-                branch: None,
-                commit: None,
-                working_tree: None,
-                changed_files: None,
-            };
+            return Self::unavailable();
         };
         let root_path = PathBuf::from(root.trim());
         let repository = root_path

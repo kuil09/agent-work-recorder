@@ -12,6 +12,7 @@ const COMMANDS: &[&str] = &[
     "checkpoint",
     "test",
     "stop",
+    "status",
 ];
 static NEXT: AtomicU64 = AtomicU64::new(0);
 

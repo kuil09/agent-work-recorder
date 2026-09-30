@@ -18,7 +18,7 @@ Phase 1에 이어 **Phase 2의 네 기능**을 제공한다.
 | MP4 챕터 | Setup, 테스트 시작, 체크포인트를 탐색 지점으로 사용 |
 | 앱 단위 캡처 | `rec start --app NAME_OR_BUNDLE_ID`: 주 모니터의 해당 앱 창들 |
 | 화면·창 캡처 | `--screen full`, `--window QUERY`, `--window-id ID` |
-| Git 맥락 | 시작 시 저장소·브랜치·커밋·작업 트리 상태 수집 |
+| Git 맥락 | 시작 시 저장소·브랜치·커밋·작업 트리 상태 수집 (`--no-git-context`로 생략) |
 | 영상 산출물 | Run/Step 오버레이가 포함된 H.264 MP4 하나 |
 
 CI는 빌드, 상태 모델, 실제 CLI/데몬 흐름, 합성 영상·오디오 인코딩, 챕터 보존을 검증한다. **CI 성공은 실제 Mac의 화면 녹화 권한, 앱 격리, 실시간 시스템 오디오까지 검증했다는 뜻이 아니다.** 실기기 점검 항목은 [Phase 2 검증 문서](docs/phase2-validation.md)에 구분해 두었다.
@@ -123,7 +123,7 @@ rec-capture list-displays
 
 ### 스크린샷 대체 경로
 
-기존 CuaDriver 스크린샷 경로는 **주 모니터 전체·오디오 OFF**일 때만 허용된다. CuaDriver가 실행 중이어야 하며, 필요하면 `REC_CUA_BIN`, `REC_CUA_SOCKET`으로 지정한다. 이 경로는 네이티브 30 fps 녹화보다 성긴 화면 기록이며 프레임 간 실제 경과 시간을 반영한다. CuaDriver 없이도 일반 ScreenCaptureKit 경로는 동작한다.
+기존 CuaDriver 스크린샷 경로는 **`--allow-screenshot-fallback`을 명시하고**, **주 모니터 전체·오디오 OFF**일 때만 허용된다. 기본값은 OFF라서 네이티브 캡처의 권한·초기화 실패가 스크린샷 녹화로 가려지지 않고 오류로 보고된다. 폴백이 사용되면 `rec status`와 `rec stop` 출력에 Warning이 표시된다. CuaDriver가 실행 중이어야 하며, 필요하면 `REC_CUA_BIN`, `REC_CUA_SOCKET`으로 지정한다. 이 경로는 네이티브 30 fps 녹화보다 성긴 화면 기록이며 프레임 간 실제 경과 시간을 반영한다. CuaDriver 없이도 일반 ScreenCaptureKit 경로는 동작한다.
 
 ## `rec test`
 
@@ -147,6 +147,8 @@ rec test -- sh -c 'printf "result\n"; exit 7'
 기본 제한 시간은 300초다. `--timeout-secs`는 실행할 명령 **앞에** 둔다. stdin은 연결하지 않는 비대화형 실행이며, 제한 시간 또는 인터럽트 시 테스트 프로세스 그룹을 종료한다. 백그라운드 서버를 남기는 용도로 사용하지 않는다.
 
 테스트 실행 중에도 데몬은 `note` 등의 명령을 받는다. 다만 두 번째 테스트 실행과 `stop`은 거부한다. 실행 결과가 다른 Run에 들어가지 않도록 시작 시의 세션과 테스트 식별자에 완료 이벤트를 연결한다.
+
+`rec test` 프로세스가 사라졌거나 PID를 확인할 수 없어도 `stop`이 영구히 막히지 않는다. 데몬은 각 테스트에 제한 시간 + 30초의 기한을 두고, 기한이 지나면 "결과 미상"으로 종료 처리한다. 즉시 정리하려면 `rec stop --abandon-test`를 사용한다(테스트 프로세스에 신호를 보내지는 않는다). 로그에서 비밀 값처럼 보이는 `NAME=값`, `--token 값`, `Bearer` 토큰, 잘 알려진 키 접두사는 영상 카드와 기록에서 마스킹한다. 이는 최선의 안전장치일 뿐이므로 출력 요약 자체를 남기지 않으려면 `rec test --no-output-summary`를 사용한다.
 
 **한 번의 `rec test`는 테스트 1건으로 집계하고 시작·완료에 각각 Step을 만든다.** 이전 관찰의 PASS 표시는 테스트 시작 시 지우며 종료 코드 0만으로 새 PASS를 만들지 않는다. 실행 결과에 대한 에이전트 판단은 별도의 `rec observe --status ...`로 남긴다.
 
@@ -190,6 +192,8 @@ ffprobe -v error -show_chapters -show_streams -of json ./review.mp4
 
 ## 데이터와 개인정보
 
+`rec start --no-git-context`는 저장소·브랜치·커밋 정보를 수집·표시·기록하지 않는다. `rec test --no-output-summary`는 출력을 터미널에는 전달하지만 영상과 이벤트 기록에는 남기지 않는다. 세션 파일과 시작 설정은 소유자 전용(0600) 권한으로 기록한다.
+
 녹화는 명시적으로 시작·종료하며 사용자 영상을 클라우드에 업로드하지 않는다. 결과물은 MP4 하나지만 실행 중에는 내부 파일을 사용한다.
 
 ```text
@@ -205,7 +209,7 @@ ffprobe -v error -show_chapters -show_streams -of json ./review.mp4
 
 macOS의 실제 임시 디렉터리는 `/tmp`와 다를 수 있다. 최종 파일 검증·게시 성공 후 Run 임시 디렉터리를 삭제한다. 실패하면 원본을 보존하며, 진단 로그는 정상 종료 후에도 남는다. 영상뿐 아니라 명령 인자·출력 요약·화면에 민감한 정보가 포함될 수 있으므로 입력과 보관 범위를 검토해야 한다.
 
-오류를 확인할 때는 출력된 Run ID에 해당하는 로그를 읽는다. 테스트가 아직 실행 중이면 끝낸 뒤 `rec stop`을 호출한다. 파일 마무리에 실패했으면 의존성·출력 경로 등 원인을 수정한 후 동일 세션의 `rec stop`을 다시 시도할 수 있다. 프로세스 충돌 후 세션 복구나 손상된 MP4 복원은 제공하지 않는다.
+오류를 확인할 때는 출력된 Run ID에 해당하는 로그를 읽는다. 테스트가 아직 실행 중이면 끝낸 뒤 `rec stop`을 호출한다(프로세스가 사라졌다면 `rec stop --abandon-test`). 녹화 중에 지정한 출력 경로에 다른 파일이 생기면 기존 파일을 보존하고 `<이름>-<RUNID>.mp4`로 게시하며 Warning을 출력한다. MP4 게시 이후의 임시 파일 정리 실패는 Warning이며 stop 실패가 아니다. 파일 마무리에 실패했으면 의존성·출력 경로 등 원인을 수정한 후 동일 세션의 `rec stop`을 다시 시도할 수 있다. 프로세스 충돌 후 세션 복구나 손상된 MP4 복원은 제공하지 않는다. 운영자용 절차는 [세션 복구](docs/session-recovery.md), 창·앱 캡처 문제는 [macOS 캡처 진단](docs/macos-capture-diagnostics.md)을 참고한다.
 
 ## 내부 구조
 
@@ -248,10 +252,10 @@ CI는 위 테스트를 실행하고 합성 MP4·FFprobe 결과를 artifact로 �
 
 ## 비목표와 제한
 
-Windows/Linux, 마이크 녹음, 자동 UI 정답 판정, 클라우드 리뷰 시스템, 행동 재생, 자동 Git commit/PR 생성, 별도 사용자 JSON/HTML 리포트는 제공하지 않는다. `rec status`, `pause`, `resume`, `cancel`, 수동 `chapter` 명령은 아직 제공하지 않는다.
+Windows/Linux, 마이크 녹음, 자동 UI 정답 판정, 클라우드 리뷰 시스템, 행동 재생, 자동 Git commit/PR 생성, 별도 사용자 JSON/HTML 리포트는 제공하지 않는다. `pause`, `resume`, `cancel`, 수동 `chapter` 명령은 아직 제공하지 않는다. `rec status`는 활성 Run을 변경 없이 조회하는 읽기 전용 명령이다.
 
 현재 앱 캡처 범위는 주 모니터다. 여러 모니터 동시 캡처, 앱 재시작 후 재연결, 실행 환경 스냅샷은 지원하지 않는다. 4자리 Run ID는 짧은 피드백 참조이며 모든 과거 실행에 대해 전역 유일성을 보장하는 식별자는 아니다.
 
 ## License
 
-`Cargo.toml`의 라이선스 표기는 MIT다.
+[MIT License](LICENSE)로 배포한다.

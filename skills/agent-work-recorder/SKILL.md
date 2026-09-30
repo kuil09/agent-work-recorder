@@ -22,8 +22,10 @@ Never copy secrets into annotations or command arguments. No automatic redaction
 
 Read `rec --help`, `rec start --help`, and `rec test --help` before the first Run.
 Use `rec <COMMAND> --help` for detailed contracts; `-h` is a short summary. Prefer the
-installed CLI over remembered flags. Do not invent `--json`, `--run-id`, `rec status`,
-`pause`, `resume`, `cancel`, or `chapter`; these are not public commands.
+installed CLI over remembered flags. Do not invent `--json`, `--run-id`,
+`pause`, `resume`, `cancel`, or `chapter`; these are not public commands. `rec status` is a
+read-only check of the active Run. For sensitive output use `rec test --no-output-summary`
+and `rec start --no-git-context`; masking of obvious secrets is only a safety net.
 
 Recording needs `rec-capture`, `ffmpeg`, `ffprobe` and Screen Recording permission.
 Help itself needs none of those and does not touch the session. Check dependencies

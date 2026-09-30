@@ -14,7 +14,8 @@ concurrency:
 
 jobs:
   test:
-    runs-on: macos-latest
+    # Pinned so runner upgrades are deliberate, not silent changes to the test platform.
+    runs-on: macos-15
     timeout-minutes: 20
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
@@ -26,6 +27,11 @@ jobs:
           command -v ffmpeg >/dev/null || brew install ffmpeg
           ffmpeg -version
           ffprobe -version
+      - name: Rust formatting and lints
+        run: |
+          rustup component add rustfmt clippy
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
       - name: Rust unit and MP4 round-trip tests
         run: cargo test --all-targets
       - name: Swift unit tests

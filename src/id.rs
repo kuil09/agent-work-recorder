@@ -72,14 +72,48 @@ pub fn ensure_unique_run_id(existing_dir: &Path) -> Result<String> {
     bail!("could not allocate a unique run id")
 }
 
+/// Write-then-rename with a private (0600), fsynced, per-process temporary file.
 pub fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
-    fs::rename(tmp, path)?;
-    Ok(())
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(value)?)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// True when `dir` holds an earlier recording (or sibling) named after this Run ID.
+/// Short IDs are feedback references, so avoid reusing one that already labels a file.
+pub fn run_id_in_recordings(dir: &Path, run_id: &str) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let name = name.strip_prefix('.').unwrap_or(&name);
+        name.strip_prefix(run_id)
+            .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('.'))
+    })
 }
 
 #[cfg(test)]
@@ -114,5 +148,32 @@ mod tests {
             output_filename("7F32", &Some("Login error UI".into())),
             "7F32-login-error-ui.mp4"
         );
+    }
+
+    #[test]
+    fn atomic_json_is_private_and_leaves_no_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rec-json-{}", std::process::id()));
+        write_json_atomic(&dir.join("session"), &serde_json::json!({"a": 1})).unwrap();
+        let mode = fs::metadata(dir.join("session"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn run_id_reuse_is_detected_from_existing_recordings() {
+        let dir = std::env::temp_dir().join(format!("rec-ids-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("7F32-login.mp4"), b"").unwrap();
+        fs::write(dir.join("A001.mp4"), b"").unwrap();
+        assert!(run_id_in_recordings(&dir, "7F32"));
+        assert!(run_id_in_recordings(&dir, "A001"));
+        assert!(!run_id_in_recordings(&dir, "7F3"));
+        assert!(!run_id_in_recordings(&dir.join("missing"), "7F32"));
+        fs::remove_dir_all(dir).unwrap();
     }
 }

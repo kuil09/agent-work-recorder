@@ -40,6 +40,13 @@ pub struct CaptureOptions {
         long_help = "Explicitly enable 48 kHz stereo AAC. Default OFF. Full-display video uses system audio; app/window video uses owning-app audio. A single-window recording can therefore include sound from the same app's OTHER windows. Never captures microphone input. Missing requested audio is an error, not silent success."
     )]
     pub system_audio: bool,
+    /// Allow a lower-frequency CuaDriver screenshot fallback (full display, video only)
+    #[arg(
+        long,
+        long_help = "Permit falling back to CuaDriver screenshots when native ScreenCaptureKit capture fails for a default/full-display, video-only Run. Default OFF so that a permission or initialization failure is reported instead of being masked. The fallback is recorded in the stop output and the MP4 comment metadata. Never applies to app, window or audio requests."
+    )]
+    #[serde(default)]
+    pub allow_screenshot_fallback: bool,
 }
 impl CaptureOptions {
     pub fn validate(&self) -> Result<()> {
@@ -77,7 +84,8 @@ impl CaptureOptions {
         }
     }
     fn allows_screenshot_fallback(&self) -> bool {
-        self.app.is_none()
+        self.allow_screenshot_fallback
+            && self.app.is_none()
             && self.window.is_none()
             && self.window_id.is_none()
             && !self.system_audio
@@ -90,11 +98,18 @@ pub struct DaemonArgs {
     pub workdir: PathBuf,
     pub output: PathBuf,
     pub capture: CaptureOptions,
+    #[serde(default)]
+    pub no_git_context: bool,
 }
+/// Margin over the client's own timeout before the daemon stops trusting a test CLI.
+const TEST_DEADLINE_GRACE: Duration = Duration::from_secs(30);
+/// Used when an older client does not report its timeout.
+const DEFAULT_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 struct ActiveTest {
     step: u32,
     owner_pid: u32,
     command: String,
+    deadline: Instant,
 }
 struct RunState {
     run_id: String,
@@ -113,6 +128,7 @@ struct RunState {
     active_test: Option<ActiveTest>,
     hold_until: Instant,
     finalizing: bool,
+    warning: Option<String>,
 }
 impl RunState {
     fn next_step(
@@ -145,6 +161,13 @@ impl RunState {
             test_result: None,
         }
     }
+    fn add_warning(&mut self, message: String) {
+        eprintln!("warning: {message}");
+        self.warning = Some(match self.warning.take() {
+            Some(existing) => format!("{existing}; {message}"),
+            None => message,
+        });
+    }
     fn response(&self) -> IpcResponse {
         let s = self.started.elapsed().as_secs();
         IpcResponse {
@@ -158,6 +181,7 @@ impl RunState {
             checkpoints: Some(self.checkpoints),
             tests: Some(self.tests),
             verdict: self.verdict.clone(),
+            warning: self.warning.clone(),
             ..Default::default()
         }
     }
@@ -178,9 +202,16 @@ fn find_capture_bin() -> Result<PathBuf> {
             return Ok(p);
         }
     }
-    let out = Command::new("which").arg("rec-capture").output()?;
-    ensure!(out.status.success(), "rec-capture not found on PATH");
-    Ok(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("rec-capture"))
+        .find(|candidate| is_executable_file(candidate))
+        .context("rec-capture not found on PATH")
+}
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 #[derive(Deserialize)]
 struct WindowInfo {
@@ -472,37 +503,94 @@ fn finish(
     if let Some(p) = state.output.parent() {
         fs::create_dir_all(p)?;
     }
+    // A file created at the requested path while recording must not cost the whole Run.
+    let published = available_output(&state.output, &state.run_id);
+    if published != state.output {
+        state.add_warning(format!(
+            "requested output {} already exists; published {} instead",
+            state.output.display(),
+            published.display()
+        ));
+        state.output = published;
+    }
     crate::media::remux(raw, &state.output, &meta, &chapters, audio, &state.run_id)?;
+    // The MP4 is published from here on: cleanup problems are warnings, never a failed stop,
+    // because a retry could not find the raw capture any more.
+    if let Err(error) = fs::remove_dir_all(&state.tmp_dir) {
+        state.add_warning(format!(
+            "MP4 published, but temporary files were not fully removed ({error}): {}",
+            state.tmp_dir.display()
+        ));
+    }
     let mut reply = state.response();
     reply.duration = Some(format!(
         "{:02}:{:02}",
         duration / 60000,
         duration / 1000 % 60
     ));
-    fs::remove_dir_all(&state.tmp_dir)?;
     Ok(reply)
 }
-fn reap_test(state: &mut RunState, capture: &mut CaptureBackend) -> Result<()> {
-    if state
-        .active_test
-        .as_ref()
-        .map(|t| !session::pid_alive(t.owner_pid))
-        .unwrap_or(false)
-    {
-        let t = state.active_test.take().unwrap();
-        let result = TestResult {
-            error: Some("test CLI exited before reporting a result; exit code unknown".into()),
-            ..Default::default()
-        };
-        record(
-            state,
-            capture,
-            EventKind::TestResult,
-            result.card_body(&t.command),
-            None,
-            Some(result),
-        )?;
+/// Returns `output`, or a sibling `<stem>-<RUNID>[-n].<ext>` when `output` is taken.
+fn available_output(output: &Path, run_id: &str) -> PathBuf {
+    if !output.exists() {
+        return output.to_path_buf();
     }
+    let stem = output
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "recording".into());
+    let ext = output
+        .extension()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mp4".into());
+    for n in 0..100 {
+        let name = if n == 0 {
+            format!("{stem}-{run_id}.{ext}")
+        } else {
+            format!("{stem}-{run_id}-{n}.{ext}")
+        };
+        let candidate = output.with_file_name(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    output.to_path_buf()
+}
+fn reap_test(state: &mut RunState, capture: &mut CaptureBackend) -> Result<()> {
+    let Some(test) = state.active_test.as_ref() else {
+        return Ok(());
+    };
+    // The deadline covers a PID that cannot be probed (EPERM) or that was reused: without
+    // it such a test would block `rec stop` forever.
+    let reason = if Instant::now() >= test.deadline {
+        "test did not report a result before its deadline; the test CLI is presumed lost, exit code unknown"
+    } else if !session::pid_alive(test.owner_pid) {
+        "test CLI exited before reporting a result; exit code unknown"
+    } else {
+        return Ok(());
+    };
+    end_test_without_result(state, capture, reason)
+}
+fn end_test_without_result(
+    state: &mut RunState,
+    capture: &mut CaptureBackend,
+    reason: &str,
+) -> Result<()> {
+    let Some(test) = state.active_test.take() else {
+        return Ok(());
+    };
+    let result = TestResult {
+        error: Some(reason.into()),
+        ..Default::default()
+    };
+    record(
+        state,
+        capture,
+        EventKind::TestResult,
+        result.card_body(&test.command),
+        None,
+        Some(result),
+    )?;
     Ok(())
 }
 fn handle(
@@ -526,12 +614,15 @@ fn handle(
         }
         IpcRequest::Status => {
             capture.health()?;
-            Ok(state.response())
+            let mut reply = state.response();
+            reply.active_test = state.active_test.as_ref().map(|t| t.command.clone());
+            Ok(reply)
         }
         IpcRequest::TestBegin {
             command,
             cwd,
             owner_pid,
+            timeout_secs,
         } => {
             ensure!(state.active_test.is_none(), "a test is already running");
             ensure!(
@@ -556,6 +647,13 @@ fn handle(
                 step: state.step,
                 owner_pid,
                 command: label,
+                deadline: Instant::now()
+                    + if timeout_secs > 0 {
+                        Duration::from_secs(timeout_secs)
+                    } else {
+                        DEFAULT_TEST_TIMEOUT
+                    }
+                    + TEST_DEADLINE_GRACE,
             });
             Ok(reply)
         }
@@ -584,7 +682,7 @@ fn handle(
             state.active_test = None;
             Ok(reply)
         }
-        IpcRequest::Stop => bail!("internal stop dispatch error"),
+        IpcRequest::Stop { .. } => bail!("internal stop dispatch error"),
     }
 }
 
@@ -613,12 +711,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     fs::create_dir_all(&tmp_dir)?;
     let raw = tmp_dir.join("raw.mp4");
     let sock = session::socket_path(&args.run_id);
-    let created = Command::new("date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .output()
-        .ok()
-        .map(|r| String::from_utf8_lossy(&r.stdout).trim().to_string())
-        .unwrap_or_default();
+    let created = utc_timestamp(SystemTime::now());
     let mut state = RunState {
         run_id: args.run_id.clone(),
         title: args.title.clone(),
@@ -632,10 +725,15 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         events: Vec::new(),
         action: args.title.clone(),
         verdict: None,
-        git: GitInfo::collect(&args.workdir),
+        git: if args.no_git_context {
+            GitInfo::unavailable()
+        } else {
+            GitInfo::collect(&args.workdir)
+        },
         active_test: None,
         hold_until: Instant::now() + Duration::from_millis(4500),
         finalizing: false,
+        warning: None,
     };
     write_json_atomic(
         &state.tmp_dir.join("session.json"),
@@ -650,11 +748,15 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         Err(e) => {
             ensure!(
                 args.capture.allows_screenshot_fallback(),
-                "native capture failed; refusing to expand scope or drop requested audio: {e:#}"
+                "native capture failed; refusing to expand scope or drop requested audio \
+                 (screenshot fallback is opt-in via --allow-screenshot-fallback): {e:#}"
             );
             eprintln!(
                 "SCK unavailable: {e:#}; falling back to full-display screenshots (no audio)"
             );
+            state.add_warning(format!(
+                "native capture failed ({e:#}); recorded with the CuaDriver screenshot fallback (full display, no audio)"
+            ));
             let p = crate::cua::CuaGrabber::start(
                 &state.run_id,
                 &state.tmp_dir,
@@ -680,29 +782,65 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         output: state.output.display().to_string(),
         title: state.title.clone(),
     })?;
-    for incoming in listener.incoming() {
-        let stream = match incoming {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-        let mut output = stream.try_clone()?;
-        let mut line = String::new();
-        if BufReader::new(stream)
-            .take(1_048_577)
-            .read_line(&mut line)
-            .is_err()
-            || line.len() > 1_048_576
-        {
-            continue;
+    // Each connection is read on its own thread so that a stalled client cannot block the
+    // recorder; requests are still executed one at a time on this thread.
+    let (tx, rx) = mpsc::channel::<(Result<IpcRequest, String>, std::os::unix::net::UnixStream)>();
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let Ok(stream) = incoming else { continue };
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                if stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .is_err()
+                    || stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .is_err()
+                {
+                    return;
+                }
+                let Ok(output) = stream.try_clone() else {
+                    return;
+                };
+                let mut line = String::new();
+                if BufReader::new(stream)
+                    .take(1_048_577)
+                    .read_line(&mut line)
+                    .is_err()
+                    || line.len() > 1_048_576
+                {
+                    return;
+                }
+                let request =
+                    serde_json::from_str::<IpcRequest>(line.trim()).map_err(|e| e.to_string());
+                let _ = tx.send((request, output));
+            });
         }
-        let request = serde_json::from_str::<IpcRequest>(line.trim());
+    });
+    loop {
+        let (request, mut output) = match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(message) => message,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Also resolve an overdue test while nobody is sending commands.
+                if let Err(error) = reap_test(&mut state, &mut capture) {
+                    eprintln!("could not close an overdue test: {error:#}");
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        };
         let mut stopped = false;
         let response = match request {
             Ok(req) => (|| -> Result<IpcResponse> {
                 reap_test(&mut state, &mut capture)?;
-                if matches!(req, IpcRequest::Stop) {
+                if let IpcRequest::Stop { abandon_test } = req {
+                    if abandon_test {
+                        end_test_without_result(
+                            &mut state,
+                            &mut capture,
+                            "abandoned by rec stop --abandon-test; exit code unknown",
+                        )?;
+                    }
                     let r = finish(&mut state, &mut capture, &raw, args.capture.system_audio)?;
                     stopped = true;
                     Ok(r)
@@ -710,17 +848,42 @@ pub fn run(args: DaemonArgs) -> Result<()> {
                     handle(req, &mut state, &mut capture)
                 }
             })(),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(anyhow::anyhow!(e)),
         };
         let response = response.unwrap_or_else(|e| IpcResponse::err(format!("{e:#}")));
         let _ = writeln!(output, "{}", serde_json::to_string(&response)?);
         if stopped {
-            session::clear_session()?;
+            if let Err(error) = session::clear_session() {
+                eprintln!("warning: {error:#}");
+            }
             let _ = fs::remove_file(&sock);
             return Ok(());
         }
     }
-    Ok(())
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` without spawning `date` (civil-from-days, proleptic Gregorian).
+pub fn utc_timestamp(time: SystemTime) -> String {
+    let secs = time
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
 }
 
 #[cfg(test)]
@@ -744,6 +907,7 @@ mod tests {
             active_test: None,
             hold_until: Instant::now(),
             finalizing: false,
+            warning: None,
         }
     }
     #[test]
@@ -759,7 +923,23 @@ mod tests {
     }
     #[test]
     fn requested_audio_or_app_never_uses_screenshot_fallback() {
-        assert!(CaptureOptions::default().allows_screenshot_fallback());
+        // Fallback is opt-in: a default Run reports native failures instead of masking them.
+        assert!(!CaptureOptions::default().allows_screenshot_fallback());
+        let opt_in = CaptureOptions {
+            allow_screenshot_fallback: true,
+            ..Default::default()
+        };
+        assert!(opt_in.allows_screenshot_fallback());
+        assert!(!CaptureOptions {
+            system_audio: true,
+            ..opt_in.clone()
+        }
+        .allows_screenshot_fallback());
+        assert!(!CaptureOptions {
+            app: Some("Safari".into()),
+            ..opt_in
+        }
+        .allows_screenshot_fallback());
         assert!(!CaptureOptions {
             system_audio: true,
             ..Default::default()
@@ -776,5 +956,34 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+    #[test]
+    fn utc_timestamp_matches_known_instants() {
+        let at = |secs| UNIX_EPOCH + Duration::from_secs(secs);
+        assert_eq!(utc_timestamp(at(0)), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            utc_timestamp(at(951_782_400 + 86_399)),
+            "2000-02-29T23:59:59Z"
+        );
+        assert_eq!(
+            utc_timestamp(at(1_782_864_000 + 3_723)),
+            "2026-07-01T01:02:03Z"
+        );
+    }
+    #[test]
+    fn conflicting_output_gets_a_run_scoped_sibling() {
+        let dir = std::env::temp_dir().join(format!("rec-out-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let wanted = dir.join("review.mp4");
+        assert_eq!(available_output(&wanted, "7F32"), wanted);
+        fs::write(&wanted, b"x").unwrap();
+        let first = available_output(&wanted, "7F32");
+        assert_eq!(first, dir.join("review-7F32.mp4"));
+        fs::write(&first, b"x").unwrap();
+        assert_eq!(
+            available_output(&wanted, "7F32"),
+            dir.join("review-7F32-1.mp4")
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }

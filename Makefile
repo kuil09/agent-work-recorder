@@ -12,7 +12,13 @@ rec-capture:
 	swift build -c release --package-path macos/RecCapture
 
 test:
-	cargo test
+	cargo fmt --check
+	cargo clippy --all-targets -- -D warnings
+	cargo test --all-targets
+	swift test --package-path macos/RecCapture
+	cargo build
+	python3 tests/e2e.py
+	python3 tests/check_session_liveness.py
 
 install: all
 	mkdir -p $(BIN)
