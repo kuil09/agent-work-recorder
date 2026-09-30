@@ -6,8 +6,10 @@ application behavior. None automatically implies the others. Read stderr before 
 | Symptom | Action | Do not do |
 | --- | --- | --- |
 | Unknown command/flag or usage error (2) | Read the installed `rec <COMMAND> --help`; fix argv ordering | Invent `status`, `cancel`, `--json` or `--run-id` |
-| No active recording | Start an authorized Run first, unless the task is only help/inspection | Assume note/test implicitly starts capture |
+| No active recording | Start an authorized Run first, unless the task is only help/inspection; preserve any stale evidence | Assume note/test implicitly starts capture or lookup cleaned up old files |
 | An active recording already exists | Identify who owns it; use it only with authorization | Kill it or remove its session/lock to make room |
+| Cannot verify recording / PID probe denied | Use the same authorized host context as start; preserve session, socket and raw media | Treat EPERM as a dead process, reset Screen Recording permissions, or remove the socket |
+| Socket pathname missing but daemon still alive | Preserve the Run and follow the verified-process recovery procedure below | Recreate the pathname, start another Run, kill unrelated processes, or claim reinstallation restores connectivity |
 | Missing/ambiguous window | Inspect `rec-capture list-windows` in the approved capture context; select a current numeric ID | Record the app/desktop as an unapproved substitute |
 | App missing/ambiguous | Inspect `rec-capture list-apps`; use the exact bundle ID | Assume an app name identifies every process/monitor |
 | Capture access unavailable | Run the read-only helper diagnosis and distinguish execution context from actual framework denial | Assume a false preflight means the user must reset permissions |
@@ -65,6 +67,41 @@ A full-display/video-only Run can use an already available CuaDriver screenshot 
 App, window and requested-audio capture cannot. A fallback is lower-frequency evidence;
 do not describe it as native continuous capture. `REC_CAPTURE` is a capture-helper override,
 not a way to bypass permissions or replace real evidence with a synthetic fixture.
+
+## Denied PID inspection and lost sockets (issue #7)
+
+Run **all** recorder commands in the same authorized context, not only discovery/start.
+An EPERM/EACCES result from a PID probe is not proof that the daemon exited. The fixed
+loader returns a diagnostic and leaves the session and socket untouched; unexpected
+probe errors do the same. Even ESRCH lookup is read-only. Do not respond to this error
+by deleting files, resetting TCC, changing HOME/TMPDIR, escalating privileges or stopping
+a Run you do not own. The old implementation could unlink the socket during lookup;
+an old binary must not be used from a restricted context.
+
+For an already-unlinked socket, installing a new binary does not reconnect the old
+daemon. Do not recreate the socket or claim a successful stop. Read the matching source
+repository's `docs/session-recovery.md` for the complete operator runbook. The safety
+rules also apply when this portable skill is installed without the repository:
+
+1. Verify the exact Run, daemon PID, user, start time, config path and descendant helper
+   PIDs. PID existence or an executable name alone does not prove identity. Resolve any
+   active test first. If ownership/identity is uncertain, report it and do not signal.
+2. Preserve session metadata, raw media, event records and logs in a private new directory
+   **before** stopping processes. A copy of an actively written raw MP4 may be incomplete.
+3. With authorization and rechecked identity, stop only the owning Rust daemon first.
+   On the native path, closing its control pipe may let the still-running helper finish
+   through its EOF handler. Do not kill the helper first or use blanket process-name/group
+   kills. This is best effort, not guaranteed recovery; Cua frame assembly is different.
+4. After verified processes stop, make a second stable copy, inspect FFprobe/decoding and
+   playback, and remux only a valid copy to a fresh output without overwriting evidence.
+   Missing moov/invalid raw media cannot be fixed by promising a simple remux. Label any
+   recovered file as salvaged raw footage; chapters, audio or the final scene may be missing.
+5. Keep cleanup separate. Never unlink a live or uncertain owner's socket. Keep raw files,
+   archive the stale session first, report cleanup errors, and do not delete `run.lock`.
+
+This runbook does not authorize automatic process termination, sandbox escape or upload
+of private evidence. Synthetic CI is not proof that an existing damaged recording was
+recovered on the user's Mac.
 
 ## Command exit statuses
 
