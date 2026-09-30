@@ -46,6 +46,8 @@ jobs:
         run: |
           cargo build
           python3 tests/e2e.py
+      - name: Session lookup with native PID permission faults (issue 7)
+        run: python3 tests/check_session_liveness.py
       - name: Upload synthetic media evidence
         if: always()
         uses: actions/upload-artifact@v4
