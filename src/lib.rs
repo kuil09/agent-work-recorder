@@ -2,5 +2,7 @@ pub mod cua;
 pub mod daemon;
 pub mod git;
 pub mod id;
+pub mod media;
 pub mod protocol;
+pub mod runner;
 pub mod session;

@@ -1,8 +1,8 @@
+//! Full-display, video-only fallback. Frame durations follow real elapsed time, not a fixed 2 fps clock.
 use crate::protocol::CaptureHud;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde_json::json;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,255 +11,117 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct CuaGrabber {
-    stop: Arc<AtomicBool>,
-    hud: Arc<Mutex<serde_json::Value>>,
-    worker: Option<JoinHandle<Result<u32>>>,
-    frames_dir: PathBuf,
-    raw_path: PathBuf,
+    stop: Arc<AtomicBool>, hud: Arc<Mutex<serde_json::Value>>,
+    worker: Option<JoinHandle<Result<()>>>, frames_dir: PathBuf, raw_path: PathBuf,
+    started: Instant, completed: bool,
 }
-
 #[derive(Clone)]
-struct CuaTarget {
-    bin: PathBuf,
-    socket: PathBuf,
-}
-
+struct CuaTarget { bin: PathBuf, socket: PathBuf }
 fn discover_cua() -> Result<CuaTarget> {
-    if let (Ok(bin), Ok(sock)) = (
-        std::env::var("REC_CUA_BIN"),
-        std::env::var("REC_CUA_SOCKET"),
-    ) {
-        return Ok(CuaTarget {
-            bin: PathBuf::from(bin),
-            socket: PathBuf::from(sock),
-        });
+    if let (Ok(bin), Ok(sock)) = (std::env::var("REC_CUA_BIN"), std::env::var("REC_CUA_SOCKET")) {
+        return Ok(CuaTarget { bin: bin.into(), socket: sock.into() });
     }
-    let out = Command::new("ps")
-        .args(["-ax", "-o", "args="])
-        .output()
-        .context("ps")?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        if !line.contains("cua-driver") || !line.contains("serve") || !line.contains("--socket") {
-            continue;
-        }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        let Some(bin) = parts.first().map(PathBuf::from) else {
-            continue;
-        };
-        if let Some(i) = parts.iter().position(|p| *p == "--socket") {
+    let out = Command::new("ps").args(["-ax", "-o", "args="]).output()?;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if !line.contains("cua-driver") || !line.contains("serve") { continue; }
+        let parts: Vec<_> = line.split_whitespace().collect();
+        if let (Some(bin), Some(i)) = (parts.first(), parts.iter().position(|p| *p == "--socket")) {
             if let Some(sock) = parts.get(i + 1) {
-                let socket = PathBuf::from(sock);
-                if socket.exists() && bin.exists() {
-                    return Ok(CuaTarget { bin, socket });
-                }
+                let t = CuaTarget { bin: bin.into(), socket: sock.into() };
+                if t.bin.exists() && t.socket.exists() { return Ok(t); }
             }
         }
     }
-    bail!("no CuaDriver socket (Screen Recording fallback unavailable)")
+    bail!("no CuaDriver socket; grant native Screen Recording permission")
 }
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
+fn screenshot(target: &CuaTarget, path: &Path) -> Result<()> {
+    let output = Command::new(&target.bin).arg("--socket").arg(&target.socket).args(["call", "get_desktop_state"])
+        .arg(json!({"screenshot_out_file":path.display().to_string()}).to_string()).output()?;
+    ensure!(output.status.success() && path.is_file(), "CuaDriver screenshot failed: {}", String::from_utf8_lossy(&output.stderr));
+    Ok(())
 }
-
-fn cua_call(target: &CuaTarget, tool: &str, args: &serde_json::Value) -> Result<String> {
-    let out = Command::new(&target.bin)
-        .arg("--socket")
-        .arg(&target.socket)
-        .arg("call")
-        .arg(tool)
-        .arg(args.to_string())
-        .output()
-        .context("cua-driver call")?;
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    if !out.status.success() {
-        bail!("cua-driver {tool} failed: {stderr} {stdout}");
+fn stamp(bin: &Path, raw: &Path, output: &Path, state: &Path, run: &str) -> Result<()> {
+    let status = Command::new(bin).arg("stamp").arg("--input").arg(raw).arg("--output").arg(output)
+        .arg("--state").arg(state).arg("--run-id").arg(run).stdout(Stdio::null()).status()?;
+    ensure!(status.success() && output.is_file(), "frame overlay failed; refusing an unaddressable screenshot");
+    Ok(())
+}
+fn concat_text(frames: &[(PathBuf, f64)], end: f64) -> String {
+    let mut out = String::from("ffconcat version 1.0\n");
+    for (i, (path, start)) in frames.iter().enumerate() {
+        let next = frames.get(i + 1).map(|x| x.1).unwrap_or(end);
+        out.push_str(&format!("file '{}'\nduration {:.6}\n", path.display().to_string().replace('\'', "'\\''"), (next - start).max(0.001)));
     }
-    Ok(stdout)
+    if let Some((path, _)) = frames.last() { out.push_str(&format!("file '{}'\n", path.display().to_string().replace('\'', "'\\''"))); }
+    out
 }
-
 impl CuaGrabber {
-    pub fn start(
-        run_id: &str,
-        tmp_dir: &Path,
-        raw_path: PathBuf,
-        capture_bin: &Path,
-        initial: CaptureHud,
-    ) -> Result<Self> {
+    pub fn start(run: &str, tmp: &Path, raw_path: PathBuf, bin: &Path, initial: CaptureHud) -> Result<Self> {
         let target = discover_cua()?;
-        let frames_dir = tmp_dir.join("frames");
-        fs::create_dir_all(&frames_dir)?;
-        let hud_path = tmp_dir.join("hud.json");
-        let mut initial_json = serde_json::to_value(&initial)?;
-        if let Some(obj) = initial_json.as_object_mut() {
-            obj.insert("run_id".into(), json!(run_id));
-            obj.insert("show_git".into(), json!(true));
-            obj.insert("show_card".into(), json!(false));
-        }
-        fs::write(&hud_path, serde_json::to_vec_pretty(&initial_json)?)?;
-
-        let probe = tmp_dir.join("probe.png");
-        let resp = cua_call(
-            &target,
-            "get_desktop_state",
-            &json!({ "screenshot_out_file": probe.display().to_string() }),
-        )?;
-        if !probe.exists() {
-            bail!("CuaDriver screenshot failed: {resp}");
-        }
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let hud = Arc::new(Mutex::new(initial_json));
-        let stop2 = stop.clone();
-        let hud2 = hud.clone();
-        let frames_dir2 = frames_dir.clone();
-        let hud_path2 = hud_path.clone();
-        let capture_bin = capture_bin.to_path_buf();
-        let run_id = run_id.to_string();
-        let target2 = target.clone();
-
-        let worker = thread::spawn(move || {
-            let mut n: u32 = 0;
-            let started = Instant::now();
+        let frames_dir = tmp.join("frames"); fs::create_dir_all(&frames_dir)?;
+        let state_path = tmp.join("hud.json");
+        let mut state = serde_json::to_value(initial)?;
+        state["run_id"] = json!(run); state["git_until_ms"] = json!(now_ms() + 4500);
+        fs::write(&state_path, serde_json::to_vec(&state)?)?;
+        let probe = tmp.join("probe.png"); screenshot(&target, &probe)?;
+        let started = Instant::now();
+        let first = frames_dir.join("f-00000.png"); stamp(bin, &probe, &first, &state_path, run)?;
+        let _ = fs::remove_file(&probe);
+        let stop = Arc::new(AtomicBool::new(false)); let stop2 = stop.clone();
+        let hud = Arc::new(Mutex::new(state)); let hud2 = hud.clone();
+        let dir = frames_dir.clone(); let bin = bin.to_path_buf(); let run = run.to_string();
+        let worker = thread::spawn(move || -> Result<()> {
+            let mut frames = vec![(first, 0.0)];
             while !stop2.load(Ordering::SeqCst) {
-                n += 1;
-                let raw = frames_dir2.join(format!("raw-{n:05}.png"));
-                let stamped = frames_dir2.join(format!("f-{n:05}.png"));
-                match cua_call(
-                    &target2,
-                    "get_desktop_state",
-                    &json!({ "screenshot_out_file": raw.display().to_string() }),
-                ) {
-                    Ok(_) if raw.exists() => {
-                        let state = hud2.lock().unwrap().clone();
-                        let mut obj = state;
-                        if let Some(map) = obj.as_object_mut() {
-                            map.insert("run_id".into(), json!(run_id));
-                            if started.elapsed() < Duration::from_secs(5) {
-                                map.insert("show_git".into(), json!(true));
-                            } else {
-                                map.insert("show_git".into(), json!(false));
-                            }
-                        }
-                        let _ = fs::write(&hud_path2, serde_json::to_vec(&obj).unwrap_or_default());
-                        let st = Command::new(&capture_bin)
-                            .args([
-                                "stamp",
-                                "--input",
-                                raw.to_str().unwrap_or(""),
-                                "--output",
-                                stamped.to_str().unwrap_or(""),
-                                "--state",
-                                hud_path2.to_str().unwrap_or(""),
-                                "--run-id",
-                                &run_id,
-                            ])
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status();
-                        if !matches!(st, Ok(s) if s.success()) {
-                            let _ = fs::copy(&raw, &stamped);
-                        }
-                        let _ = fs::remove_file(&raw);
-                    }
-                    Ok(resp) => eprintln!("cua grab: {resp}"),
-                    Err(e) => eprintln!("cua grab: {e:#}"),
-                }
+                let raw = dir.join("current.png"); screenshot(&target, &raw)?;
+                let captured = started.elapsed().as_secs_f64();
+                let stamped = dir.join(format!("f-{:05}.png", frames.len()));
+                fs::write(&state_path, serde_json::to_vec(&*hud2.lock().unwrap())?)?;
+                stamp(&bin, &raw, &stamped, &state_path, &run)?;
+                frames.push((stamped, captured)); let _ = fs::remove_file(raw);
                 thread::sleep(Duration::from_millis(450));
             }
-            Ok(n)
+            fs::write(dir.join("list.txt"), concat_text(&frames, started.elapsed().as_secs_f64()))?;
+            Ok(())
         });
-
-        eprintln!("capture: {{\"event\":\"ready\",\"backend\":\"cua\"}}");
-        Ok(CuaGrabber {
-            stop,
-            hud,
-            worker: Some(worker),
-            frames_dir,
-            raw_path,
-        })
+        Ok(Self { stop, hud, worker: Some(worker), frames_dir, raw_path, started, completed: false })
     }
-
+    pub fn started(&self) -> Instant { self.started }
     pub fn send(&self, hud: &CaptureHud) -> Result<()> {
+        ensure!(!self.worker.as_ref().map(|h| h.is_finished()).unwrap_or(true), "screenshot worker is no longer running");
         let incoming = serde_json::to_value(hud)?;
         let mut cur = self.hud.lock().unwrap();
         if let (Some(dst), Some(src)) = (cur.as_object_mut(), incoming.as_object()) {
-            for (k, v) in src {
-                if !v.is_null() {
-                    dst.insert(k.clone(), v.clone());
-                }
+            for (key, value) in src {
+                if key == "verdict" {
+                    if hud.cmd == "hud" { dst.insert(key.clone(), value.clone()); }
+                } else if !value.is_null() { dst.insert(key.clone(), value.clone()); }
             }
-        } else {
-            *cur = incoming;
-        }
-        if hud.cmd == "card" {
-            if let Some(obj) = cur.as_object_mut() {
-                obj.insert(
-                    "card_until_ms".into(),
-                    json!(now_unix_ms().saturating_add(4_000)),
-                );
-            }
+            if hud.cmd == "card" { dst.insert("card_until_ms".into(), json!(now_ms() + 4000)); }
+            if hud.cmd == "git" { dst.insert("git_until_ms".into(), json!(now_ms() + 4500)); }
         }
         Ok(())
     }
-
     pub fn stop(&mut self) -> Result<()> {
+        if self.completed { return Ok(()); }
         self.stop.store(true, Ordering::SeqCst);
-        let frames = if let Some(h) = self.worker.take() {
-            h.join().unwrap_or(Ok(0))?
-        } else {
-            0
-        };
-        if frames == 0 {
-            bail!("CuaDriver grabber captured 0 frames");
-        }
-        let list = self.frames_dir.join("list.txt");
-        let mut f = File::create(&list)?;
-        let mut names: Vec<_> = fs::read_dir(&self.frames_dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("f-") && n.ends_with(".png"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        names.sort();
-        for p in &names {
-            writeln!(f, "file '{}'", p.display())?;
-            writeln!(f, "duration 0.5")?;
-        }
-        if let Some(last) = names.last() {
-            writeln!(f, "file '{}'", last.display())?;
-        }
-        f.flush()?;
-
-        let status = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-            ])
-            .arg(&list)
-            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
-            .arg(&self.raw_path)
-            .status()
-            .context("ffmpeg concat")?;
-        if !status.success() {
-            bail!("ffmpeg concat failed");
-        }
-        Ok(())
+        if let Some(h) = self.worker.take() { h.join().map_err(|_| anyhow::anyhow!("screenshot worker panicked"))??; }
+        let output = Command::new("ffmpeg").args(["-y", "-nostdin", "-v", "error", "-f", "concat", "-safe", "0", "-i"])
+            .arg(self.frames_dir.join("list.txt"))
+            .args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-fps_mode", "vfr"])
+            .arg(&self.raw_path).output().context("ffmpeg screenshot encoding")?;
+        ensure!(output.status.success(), "screenshot encoding failed: {}", String::from_utf8_lossy(&output.stderr));
+        self.completed = true; Ok(())
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn frame_durations_use_elapsed_time_and_escape_paths() {
+        let text = concat_text(&[(PathBuf::from("/tmp/a'b.png"), 0.0), (PathBuf::from("/tmp/c.png"), 1.75)], 4.0);
+        assert!(text.contains("duration 1.750000")); assert!(text.contains("duration 2.250000"));
+        assert!(text.contains("a'\\''b.png"));
     }
 }

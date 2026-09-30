@@ -6,775 +6,250 @@ import Darwin
 import Foundation
 import ScreenCaptureKit
 
-final class OverlayState: @unchecked Sendable {
-    let lock = NSLock()
-    var runId = "----"
-    var step: UInt32 = 0
-    var action: String?
-    var verdict: String?
-    var cardKind: String?
-    var cardBody: String?
-    var cardUntil: Date?
-    var gitTitle: String?
-    var gitRepo: String?
-    var gitBranch: String?
-    var gitCommit: String?
-    var gitTree: String?
-    var gitUntil: Date?
-    var targetLost = false
-
-    func snapshot() -> OverlayState {
-        lock.lock()
-        defer { lock.unlock() }
-        let copy = OverlayState()
-        copy.runId = runId
-        copy.step = step
-        copy.action = action
-        copy.verdict = verdict
-        copy.cardKind = cardKind
-        copy.cardBody = cardBody
-        copy.cardUntil = cardUntil
-        copy.gitTitle = gitTitle
-        copy.gitRepo = gitRepo
-        copy.gitBranch = gitBranch
-        copy.gitCommit = gitCommit
-        copy.gitTree = gitTree
-        copy.gitUntil = gitUntil
-        copy.targetLost = targetLost
-        return copy
-    }
-
-    func apply(json: [String: Any]) {
-        lock.lock()
-        defer { lock.unlock() }
-        let cmd = json["cmd"] as? String ?? ""
-        if let run = json["run_id"] as? String { runId = run }
-        if let step = json["step"] as? UInt32 { self.step = step }
-        else if let step = json["step"] as? Int { self.step = UInt32(step) }
-        switch cmd {
-        case "hud":
-            if let a = json["action"] as? String { action = a }
-            if json["verdict"] is NSNull { verdict = nil }
-            else if let v = json["verdict"] as? String { verdict = v }
-        case "card":
-            cardKind = json["kind"] as? String
-            cardBody = json["body"] as? String
-            cardUntil = Date().addingTimeInterval(4.0)
-        case "git":
-            gitTitle = json["title"] as? String
-            gitRepo = json["repository"] as? String
-            gitBranch = json["branch"] as? String
-            gitCommit = json["commit"] as? String
-            gitTree = json["working_tree"] as? String
-            gitUntil = Date().addingTimeInterval(4.5)
-        case "target_lost":
-            targetLost = true
-        case "target_restored":
-            targetLost = false
-        default:
-            break
-        }
-    }
+private let outputLock = NSLock()
+func emit(_ object: [String: Any]) {
+    guard let data = try? JSONSerialization.data(withJSONObject: object), let line = String(data: data, encoding: .utf8) else { return }
+    outputLock.lock(); defer { outputLock.unlock() }
+    fputs(line + "\n", stdout); fflush(stdout)
 }
-
-func emit(_ obj: [String: Any]) {
-    guard JSONSerialization.isValidJSONObject(obj),
-          let data = try? JSONSerialization.data(withJSONObject: obj, options: []),
-          let line = String(data: data, encoding: .utf8) else { return }
-    fputs(line + "\n", stdout)
-    fflush(stdout)
-}
-
-func failPermission() -> Never {
-    emit(["event": "permission-denied"])
-    fputs(
-        "Screen Recording permission is required.\n\nSystem Settings >\nPrivacy & Security >\nScreen & System Audio Recording\n",
-        stderr
-    )
-    exit(2)
-}
-
-func ensurePermission() {
+func ensurePermission() throws {
     if CGPreflightScreenCaptureAccess() { return }
     CGRequestScreenCaptureAccess()
-    // Grant is not immediate; caller still may fail until relaunch.
-    if !CGPreflightScreenCaptureAccess() {
-        failPermission()
+    guard CGPreflightScreenCaptureAccess() else {
+        throw RecorderError("Screen Recording permission is required.\nSystem Settings > Privacy & Security > Screen & System Audio Recording\nGrant access to the invoking terminal/agent and relaunch it.")
     }
 }
-
 func fetchContent() throws -> SCShareableContent {
-    let sem = DispatchSemaphore(value: 0)
-    var result: Result<SCShareableContent, Error>!
+    let done = DispatchSemaphore(value: 0)
+    var result: Result<SCShareableContent, Error>?
     SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
-        if let content {
-            result = .success(content)
-        } else {
-            result = .failure(error ?? NSError(domain: "rec-capture", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "no shareable content",
-            ]))
-        }
-        sem.signal()
+        if let content { result = .success(content) }
+        else { result = .failure(error ?? RecorderError("no shareable content")) }
+        done.signal()
     }
-    if sem.wait(timeout: .now() + 8) == .timedOut {
-        throw NSError(domain: "rec-capture", code: 1, userInfo: [
-            NSLocalizedDescriptionKey: "timed out fetching shareable content",
-        ])
-    }
+    guard done.wait(timeout: .now() + 8) == .success, let result else { throw RecorderError("shareable content discovery timed out") }
     return try result.get()
 }
-
-func listWindows() throws {
-    ensurePermission()
-    let content = try fetchContent()
-    let rows: [[String: Any]] = content.windows.compactMap { w in
-        let frame = w.frame
-        if frame.width < 80 || frame.height < 80 { return nil }
-        return [
-            "id": w.windowID,
-            "app": w.owningApplication?.applicationName ?? "",
-            "bundle": w.owningApplication?.bundleIdentifier ?? "",
-            "title": w.title ?? "",
-            "width": Int(frame.width),
-            "height": Int(frame.height),
-        ]
-    }
-    let data = try JSONSerialization.data(withJSONObject: rows, options: [.prettyPrinted])
-    FileHandle.standardOutput.write(data)
-    FileHandle.standardOutput.write(Data("\n".utf8))
-}
-
-func listDisplays() throws {
-    ensurePermission()
-    let content = try fetchContent()
-    let main = CGMainDisplayID()
-    let rows: [[String: Any]] = content.displays.map { d in
-        [
-            "id": d.displayID,
-            "width": d.width,
-            "height": d.height,
-            "main": d.displayID == main,
-        ]
-    }
-    let data = try JSONSerialization.data(withJSONObject: rows, options: [.prettyPrinted])
-    FileHandle.standardOutput.write(data)
-    FileHandle.standardOutput.write(Data("\n".utf8))
-}
-
-final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
-    let outputURL: URL
-    let overlay: OverlayState
-    let videoQueue = DispatchQueue(label: "rec.capture.video")
-    var stream: SCStream?
-    var writer: AVAssetWriter?
-    var writerInput: AVAssetWriterInput?
-    var adaptor: AVAssetWriterInputPixelBufferAdaptor?
-    var startedWriting = false
-    var lastBuffer: CVPixelBuffer?
-    var lastPTS: CMTime = .zero
-    var freezeTimer: DispatchSourceTimer?
-    var width = 0
-    var height = 0
-    let stopLock = NSLock()
-    var stopping = false
-
-    init(outputURL: URL, overlay: OverlayState) {
-        self.outputURL = outputURL
-        self.overlay = overlay
-    }
-
-    func start(windowId: UInt32?, display: String?) throws {
-        ensurePermission()
-        let content = try fetchContent()
-        let filter: SCContentFilter
-        if let windowId {
-            guard let window = content.windows.first(where: { $0.windowID == windowId }) else {
-                throw NSError(domain: "rec-capture", code: 3, userInfo: [
-                    NSLocalizedDescriptionKey: "window \(windowId) not found",
-                ])
-            }
-            filter = SCContentFilter(desktopIndependentWindow: window)
-        } else {
-            let main = CGMainDisplayID()
-            let displayObj: SCDisplay?
-            if display == nil || display == "main" {
-                displayObj = content.displays.first(where: { $0.displayID == main }) ?? content.displays.first
-            } else if let id = UInt32(display ?? "") {
-                displayObj = content.displays.first(where: { $0.displayID == id })
-            } else {
-                displayObj = content.displays.first(where: { $0.displayID == main })
-            }
-            guard let displayObj else {
-                throw NSError(domain: "rec-capture", code: 3, userInfo: [
-                    NSLocalizedDescriptionKey: "display not found",
-                ])
-            }
-            filter = SCContentFilter(display: displayObj, excludingWindows: [])
-        }
-
-        var w = 0
-        var h = 0
-        if #available(macOS 14.0, *) {
-            let scale = CGFloat(filter.pointPixelScale)
-            w = Int(filter.contentRect.width * scale)
-            h = Int(filter.contentRect.height * scale)
-        } else {
-            w = Int(filter.contentRect.width)
-            h = Int(filter.contentRect.height)
-        }
-        if w < 2 || h < 2 {
-            w = 1280
-            h = 720
-        }
-        w -= w % 2
-        h -= h % 2
-        width = w
-        height = h
-
-        let config = SCStreamConfiguration()
-        config.width = w
-        config.height = h
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-        config.pixelFormat = kCVPixelFormatType_32BGRA
-        config.showsCursor = true
-        config.queueDepth = 8
-        if #available(macOS 14.0, *) {
-            config.capturesAudio = false
-        }
-
-        try FileManager.default.createDirectory(
-            at: outputURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        if FileManager.default.fileExists(atPath: outputURL.path) {
-            try FileManager.default.removeItem(at: outputURL)
-        }
-
-        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
-        let settings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: w,
-            AVVideoHeightKey: h,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: max(2_000_000, w * h * 3),
-                AVVideoExpectedSourceFrameRateKey: 30,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-            ],
-        ]
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-        input.expectsMediaDataInRealTime = true
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: input,
-            sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                kCVPixelBufferWidthKey as String: w,
-                kCVPixelBufferHeightKey as String: h,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
-            ]
-        )
-        guard writer.canAdd(input) else {
-            throw NSError(domain: "rec-capture", code: 4, userInfo: [
-                NSLocalizedDescriptionKey: "cannot add video input",
-            ])
-        }
-        writer.add(input)
-        self.writer = writer
-        self.writerInput = input
-        self.adaptor = adaptor
-
-        let stream = SCStream(filter: filter, configuration: config, delegate: self)
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQueue)
-        self.stream = stream
-
-        let sem = DispatchSemaphore(value: 0)
-        var startError: Error?
-        stream.startCapture { error in
-            startError = error
-            sem.signal()
-        }
-        if sem.wait(timeout: .now() + 8) == .timedOut {
-            throw NSError(domain: "rec-capture", code: 5, userInfo: [
-                NSLocalizedDescriptionKey: "startCapture timed out",
-            ])
-        }
-        if let startError {
-            let ns = startError as NSError
-            if ns.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain" ||
-                ns.localizedDescription.lowercased().contains("denied")
-            {
-                failPermission()
-            }
-            throw startError
-        }
-        emit(["event": "started", "width": w, "height": h])
-        emit(["event": "ready"])
-    }
-
-    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen else { return }
-        guard let pixel = sampleBuffer.imageBuffer else { return }
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        append(pixel: pixel, pts: pts)
-    }
-
-    func stream(_ stream: SCStream, didStopWithError error: Error) {
-        overlay.lock.lock()
-        overlay.targetLost = true
-        overlay.lock.unlock()
-        emit(["event": "target_lost", "message": error.localizedDescription])
-        startFreezeClock()
-    }
-
-    func append(pixel: CVPixelBuffer, pts: CMTime) {
-        stopLock.lock()
-        let stoppingNow = stopping
-        stopLock.unlock()
-        if stoppingNow { return }
-
-        guard let writer, let writerInput, let adaptor else { return }
-        if !startedWriting {
-            writer.startWriting()
-            writer.startSession(atSourceTime: pts)
-            startedWriting = true
-        }
-        guard writerInput.isReadyForMoreMediaData else { return }
-        lastBuffer = pixel
-        lastPTS = pts
-        let composed = composite(pixel) ?? pixel
-        _ = adaptor.append(composed, withPresentationTime: pts)
-    }
-
-    func startFreezeClock() {
-        freezeTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: videoQueue)
-        timer.schedule(deadline: .now() + 1.0 / 30.0, repeating: 1.0 / 30.0)
-        timer.setEventHandler { [weak self] in
-            guard let self, let last = self.lastBuffer else { return }
-            let next = CMTimeAdd(self.lastPTS, CMTime(value: 1, timescale: 30))
-            self.append(pixel: last, pts: next)
-        }
-        freezeTimer = timer
-        timer.resume()
-    }
-
-    func stop(completion: @escaping () -> Void) {
-        stopLock.lock()
-        if stopping {
-            stopLock.unlock()
-            return
-        }
-        stopping = true
-        stopLock.unlock()
-        freezeTimer?.cancel()
-        freezeTimer = nil
-        let finishWriter = { [weak self] in
-            guard let self else { completion(); return }
-            self.writerInput?.markAsFinished()
-            self.writer?.finishWriting {
-                emit(["event": "stopped", "path": self.outputURL.path])
-                completion()
-            }
-        }
-        if let stream {
-            stream.stopCapture { _ in finishWriter() }
-        } else {
-            finishWriter()
-        }
-    }
-
-    func composite(_ src: CVPixelBuffer) -> CVPixelBuffer? {
-        let w = CVPixelBufferGetWidth(src)
-        let h = CVPixelBufferGetHeight(src)
-        var dst: CVPixelBuffer?
-        let attrs: [CFString: Any] = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferCGImageCompatibilityKey: true,
-            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
-            kCVPixelBufferIOSurfacePropertiesKey: [:] as [CFString: Any],
-        ]
-        let status = CVPixelBufferCreate(
-            kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
-            attrs as CFDictionary, &dst
-        )
-        guard status == kCVReturnSuccess, let dst else { return nil }
-
-        CVPixelBufferLockBaseAddress(src, .readOnly)
-        CVPixelBufferLockBaseAddress(dst, [])
-        defer {
-            CVPixelBufferUnlockBaseAddress(src, .readOnly)
-            CVPixelBufferUnlockBaseAddress(dst, [])
-        }
-
-        let srcAddr = CVPixelBufferGetBaseAddress(src)!
-        let dstAddr = CVPixelBufferGetBaseAddress(dst)!
-        let srcStride = CVPixelBufferGetBytesPerRow(src)
-        let dstStride = CVPixelBufferGetBytesPerRow(dst)
-        for row in 0..<h {
-            memcpy(dstAddr.advanced(by: row * dstStride), srcAddr.advanced(by: row * srcStride), min(srcStride, dstStride))
-        }
-
-        guard let ctx = CGContext(
-            data: dstAddr,
-            width: w,
-            height: h,
-            bitsPerComponent: 8,
-            bytesPerRow: dstStride,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-        ) else { return dst }
-
-        let ns = NSGraphicsContext(cgContext: ctx, flipped: true)
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = ns
-        drawOverlay(size: NSSize(width: w, height: h), state: overlay.snapshot())
-        NSGraphicsContext.restoreGraphicsState()
-        return dst
-    }
-}
-
-func drawOverlay(size: NSSize, state: OverlayState) {
-    let idFont = NSFont.monospacedSystemFont(ofSize: 24, weight: .bold)
-    let kindFont = NSFont.monospacedSystemFont(ofSize: 18, weight: .bold)
-    let bodyFont = NSFont.systemFont(ofSize: 17, weight: .medium)
-    let metaFont = NSFont.monospacedSystemFont(ofSize: 15, weight: .regular)
-    let pad: CGFloat = 14
-    let lineH: CGFloat = 26
-
-    let hudId = String(format: "%@:%03u", state.runId, state.step)
-    let now = Date()
-    let cardVisible = state.cardUntil.map { $0 > now } ?? false
-    let gitVisible = state.gitUntil.map { $0 > now } ?? false
-    let kind = cardVisible ? state.cardKind : nil
-    let eventBody = cardVisible ? state.cardBody : nil
-    let action = state.action
-    let verdict = state.verdict
-    let gitLine = gitOneLine(state)
-    let lost = state.targetLost
-
-    var rows: CGFloat = 2
-    if gitVisible { rows += 1 }
-    if lost { rows += 1 }
-    let barH = pad * 2 + rows * lineH + 4
-    let bar = NSRect(x: 0, y: 0, width: size.width, height: barH)
-
-    NSColor(white: 0.05, alpha: 0.92).setFill()
-    bar.fill()
-    NSColor.white.setStroke()
-    let edge = NSBezierPath()
-    edge.move(to: NSPoint(x: 0, y: bar.maxY))
-    edge.line(to: NSPoint(x: size.width, y: bar.maxY))
-    edge.lineWidth = 2
-    edge.stroke()
-
-    var y = pad
-    let idAttr: [NSAttributedString.Key: Any] = [.font: idFont, .foregroundColor: NSColor.white]
-    (hudId as NSString).draw(at: NSPoint(x: pad, y: y), withAttributes: idAttr)
-
-    if let kind, !kind.isEmpty {
-        let kindColor: NSColor
-        switch kind {
-        case "CHECKPOINT":
-            kindColor = NSColor(calibratedRed: 1, green: 0.78, blue: 0.2, alpha: 1)
-        case "EXPECT":
-            kindColor = NSColor(calibratedRed: 0.45, green: 0.75, blue: 1, alpha: 1)
-        case "OBSERVE":
-            kindColor = NSColor(calibratedRed: 0.45, green: 1, blue: 0.55, alpha: 1)
-        case "NOTE":
-            kindColor = NSColor(white: 0.85, alpha: 1)
-        default:
-            kindColor = NSColor.white
-        }
-        (kind as NSString).draw(
-            at: NSPoint(x: pad + 150, y: y + 3),
-            withAttributes: [.font: kindFont, .foregroundColor: kindColor]
-        )
-    }
-
-    if let verdict, !verdict.isEmpty {
-        let color: NSColor
-        if verdict.contains("FAIL") {
-            color = NSColor(calibratedRed: 1, green: 0.35, blue: 0.35, alpha: 1)
-        } else if verdict.contains("PASS") {
-            color = NSColor(calibratedRed: 0.45, green: 1, blue: 0.55, alpha: 1)
-        } else if verdict.contains("UNCERTAIN") {
-            color = NSColor(calibratedRed: 1, green: 0.85, blue: 0.2, alpha: 1)
-        } else {
-            color = .white
-        }
-        let v = verdict as NSString
-        let vw = v.size(withAttributes: [.font: kindFont]).width
-        v.draw(
-            at: NSPoint(x: max(pad, size.width - pad - vw), y: y + 3),
-            withAttributes: [.font: kindFont, .foregroundColor: color]
-        )
-    }
-
-    y += lineH
-    let body = eventBody?.isEmpty == false ? eventBody! : (action ?? "")
-    if !body.isEmpty {
-        let shown = truncate(body, 110)
-        (shown as NSString).draw(
-            at: NSPoint(x: pad, y: y),
-            withAttributes: [.font: bodyFont, .foregroundColor: NSColor.white]
-        )
-    }
-
-    if gitVisible {
-        y += lineH
-        (truncate(gitLine, 120) as NSString).draw(
-            at: NSPoint(x: pad, y: y),
-            withAttributes: [.font: metaFont, .foregroundColor: NSColor(white: 0.8, alpha: 1)]
-        )
-    }
-
-    if lost {
-        y += lineH
-        ("CAPTURE TARGET LOST" as NSString).draw(
-            at: NSPoint(x: pad, y: y),
-            withAttributes: [
-                .font: kindFont,
-                .foregroundColor: NSColor(calibratedRed: 1, green: 0.35, blue: 0.35, alpha: 1),
-            ]
-        )
-    }
-
-}
-
-func gitOneLine(_ state: OverlayState) -> String {
-    if let r = state.gitRepo, let b = state.gitBranch, let c = state.gitCommit {
-        let tree = state.gitTree ?? ""
-        let title = state.gitTitle.map { "\($0)  " } ?? ""
-        return "\(title)\(r)  \(b)  \(c)  \(tree)".trimmingCharacters(in: .whitespaces)
-    }
-    return "Git: unavailable"
-}
-
-func truncate(_ s: String, _ n: Int) -> String {
-    if s.count <= n { return s }
-    return String(s.prefix(n - 1)) + "…"
-}
-
-func wrap(_ s: String, font: NSFont, width: CGFloat) -> [String] {
-    var lines: [String] = []
-    for raw in s.split(separator: "\n", omittingEmptySubsequences: false) {
-        var current = ""
-        for word in raw.split(separator: " ", omittingEmptySubsequences: false) {
-            let next = current.isEmpty ? String(word) : current + " " + word
-            let w = (next as NSString).size(withAttributes: [.font: font]).width
-            if w > width, !current.isEmpty {
-                lines.append(current)
-                current = String(word)
-            } else {
-                current = next
-            }
-        }
-        lines.append(current)
-    }
-    return Array(lines.prefix(8))
-}
-
 struct Args {
     var command = "start"
     var output: String?
     var runId = "----"
     var windowId: UInt32?
     var display: String?
+    var app: String?
+    var systemAudio = false
     var input: String?
     var state: String?
-}
-
-func parseArgs() -> Args {
-    var a = Args()
-    var it = CommandLine.arguments.dropFirst().makeIterator()
-    if let first = CommandLine.arguments.dropFirst().first, !first.hasPrefix("-") {
-        a.command = first
-        _ = it.next()
-    }
-    // re-parse simply
-    let args = Array(CommandLine.arguments.dropFirst())
-    var i = 0
-    if i < args.count, !args[i].hasPrefix("-") {
-        a.command = args[i]
-        i += 1
-    }
-    while i < args.count {
-        let t = args[i]
-        i += 1
-        func take() -> String {
-            guard i < args.count else { return "" }
-            let v = args[i]
-            i += 1
-            return v
+    static func parse(_ values: [String]) throws -> Args {
+        var a = Args(); var i = 0
+        if let first = values.first, !first.hasPrefix("-") { a.command = first; i = 1 }
+        while i < values.count {
+            let flag = values[i]; i += 1
+            if flag == "--system-audio" { a.systemAudio = true; continue }
+            guard i < values.count else { throw RecorderError("missing value for \(flag)") }
+            let value = values[i]; i += 1
+            switch flag {
+            case "--output": a.output = value
+            case "--run-id": a.runId = value
+            case "--window-id":
+                guard let id = UInt32(value), id > 0 else { throw RecorderError("invalid window ID") }; a.windowId = id
+            case "--display": a.display = value
+            case "--app":
+                guard !value.trimmingCharacters(in: .whitespaces).isEmpty else { throw RecorderError("application target cannot be empty") }; a.app = value
+            case "--input": a.input = value
+            case "--state": a.state = value
+            default: throw RecorderError("unknown option: \(flag)")
+            }
         }
-        switch t {
-        case "--output": a.output = take()
-        case "--run-id": a.runId = take()
-        case "--window-id": a.windowId = UInt32(take())
-        case "--display": a.display = take()
-        case "--input": a.input = take()
-        case "--state": a.state = take()
-        default: break
+        if a.windowId != nil && (a.app != nil || a.display != nil) { throw RecorderError("window capture cannot be combined with app/display capture") }
+        return a
+    }
+}
+func listContent(_ command: String) throws {
+    try ensurePermission(); let content = try fetchContent()
+    let rows: [[String: Any]]
+    switch command {
+    case "list-windows":
+        rows = content.windows.filter { $0.frame.width >= 80 && $0.frame.height >= 80 }.map {
+            ["id": $0.windowID, "app": $0.owningApplication?.applicationName ?? "", "bundle": $0.owningApplication?.bundleIdentifier ?? "", "title": $0.title ?? "", "width": Int($0.frame.width), "height": Int($0.frame.height)]
+        }
+    case "list-apps":
+        rows = content.applications.map { ["name": $0.applicationName, "bundle": $0.bundleIdentifier, "pid": Int($0.processID)] }
+    default:
+        rows = content.displays.map { ["id": $0.displayID, "width": $0.width, "height": $0.height, "main": $0.displayID == CGMainDisplayID()] }
+    }
+    FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: rows, options: [.prettyPrinted]))
+    FileHandle.standardOutput.write(Data("\n".utf8))
+}
+
+final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
+    let queue = DispatchQueue(label: "rec.capture.media")
+    let overlay: OverlayState
+    let url: URL
+    var stream: SCStream?
+    var writer: MediaWriter?
+    var lastBuffer: CVPixelBuffer?
+    var timer: DispatchSourceTimer?
+    var stopping = false
+    var ready = false
+    var failure: Error?
+    var appPIDs: [pid_t] = []
+    var lastAppCheck = Date.distantPast
+    init(url: URL, overlay: OverlayState) { self.url = url; self.overlay = overlay }
+
+    func start(_ args: Args) throws {
+        try ensurePermission(); let content = try fetchContent()
+        let filter: SCContentFilter
+        if let id = args.windowId {
+            guard let window = content.windows.first(where: { $0.windowID == id }) else { throw RecorderError("window \(id) not found") }
+            filter = SCContentFilter(desktopIndependentWindow: window)
+        } else {
+            let displayID: CGDirectDisplayID
+            if args.display == nil || args.display == "main" { displayID = CGMainDisplayID() }
+            else if let id = UInt32(args.display ?? "") { displayID = id }
+            else { throw RecorderError("invalid display ID") }
+            guard let display = content.displays.first(where: { $0.displayID == displayID }) else { throw RecorderError("display not found") }
+            if let query = args.app {
+                let exact = content.applications.filter { $0.bundleIdentifier == query || $0.applicationName.lowercased() == query.lowercased() }
+                guard !exact.isEmpty else { throw RecorderError("application not found; use rec-capture list-apps and an exact name or bundle ID") }
+                guard Set(exact.map { $0.bundleIdentifier }).count == 1 else { throw RecorderError("application name is ambiguous; use its bundle ID") }
+                appPIDs = exact.map { $0.processID }
+                // App inclusion keeps newly created windows of these applications in scope.
+                // Other applications are never added. This filter is restricted to this display.
+                filter = SCContentFilter(display: display, including: exact, exceptingWindows: [])
+            } else { filter = SCContentFilter(display: display, excludingWindows: []) }
+        }
+        let scale = CGFloat(filter.pointPixelScale)
+        var width = max(2, Int(filter.contentRect.width * scale))
+        var height = max(2, Int(filter.contentRect.height * scale))
+        width -= width % 2; height -= height % 2
+        let config = SCStreamConfiguration()
+        config.width = width; config.height = height
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        config.pixelFormat = kCVPixelFormatType_32BGRA
+        config.showsCursor = true; config.queueDepth = 8
+        config.capturesAudio = args.systemAudio
+        config.sampleRate = 48_000; config.channelCount = 2
+        config.excludesCurrentProcessAudio = true
+        // No microphone capture or microphone output is ever configured.
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        writer = try MediaWriter(url: url, width: width, height: height, systemAudio: args.systemAudio, overlay: overlay)
+        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        if args.systemAudio { try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue) }
+        self.stream = stream
+        let done = DispatchSemaphore(value: 0); var startError: Error?
+        stream.startCapture { error in startError = error; done.signal() }
+        guard done.wait(timeout: .now() + 8) == .success else { throw RecorderError("startCapture timed out") }
+        if let startError { throw startError }
+        emit(["event": "started", "width": width, "height": height, "system_audio": args.systemAudio])
+    }
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard !stopping, failure == nil, CMSampleBufferIsValid(sampleBuffer) else { return }
+        do {
+            switch type {
+            case .screen:
+                if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+                   let status = attachments.first?[.status] as? Int, status != SCFrameStatus.complete.rawValue { return }
+                guard let pixel = sampleBuffer.imageBuffer else { return }
+                lastBuffer = pixel
+                if timer == nil {
+                    render()
+                    let timer = DispatchSource.makeTimerSource(queue: queue)
+                    timer.schedule(deadline: .now() + 1.0 / 30, repeating: 1.0 / 30)
+                    timer.setEventHandler { [weak self] in self?.render() }
+                    self.timer = timer; timer.resume()
+                }
+            case .audio: try writer?.appendAudio(sampleBuffer)
+            default: break
+            }
+        } catch { fail(error) }
+    }
+    func render() {
+        guard !stopping, failure == nil, let pixel = lastBuffer, let writer else { return }
+        if !appPIDs.isEmpty && Date().timeIntervalSince(lastAppCheck) >= 1 {
+            lastAppCheck = Date()
+            if appPIDs.allSatisfy({ NSRunningApplication(processIdentifier: $0)?.isTerminated ?? true }) { overlay.apply(json: ["cmd": "target_lost"]) }
+        }
+        do {
+            let now = CMClockGetTime(CMClockGetHostTimeClock())
+            if try writer.appendVideo(pixel, at: now), !ready, let origin = writer.origin {
+                ready = true
+                let elapsed = max(0, CMTimeGetSeconds(CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), origin)) * 1000)
+                emit(["event": "ready", "elapsed_ms": Int(elapsed)])
+            }
+        } catch { fail(error) }
+    }
+    func fail(_ error: Error) {
+        if failure == nil { failure = error; emit(["event": "error", "message": error.localizedDescription]) }
+    }
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        queue.async { [self] in
+            overlay.apply(json: ["cmd": "target_lost"])
+            emit(["event": "target_lost", "message": error.localizedDescription])
+            // Heartbeat keeps the last scoped frame and a visible target-lost warning.
         }
     }
-    return a
-}
-
-func stampFrame(input: String, output: String, statePath: String?, runId: String) {
-    let overlay = OverlayState()
-    overlay.runId = runId
-    if let statePath, let data = try? Data(contentsOf: URL(fileURLWithPath: statePath)),
-       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    {
-        overlay.apply(json: obj)
-        if let run = obj["run_id"] as? String { overlay.runId = run }
-        if let step = obj["step"] as? Int { overlay.step = UInt32(step) }
-        if let a = obj["action"] as? String { overlay.action = a }
-        if let v = obj["verdict"] as? String { overlay.verdict = v }
-        if let k = obj["kind"] as? String { overlay.cardKind = k }
-        if let b = obj["body"] as? String { overlay.cardBody = b }
-        if let until = obj["card_until_ms"] as? NSNumber {
-            overlay.cardUntil = Date(timeIntervalSince1970: until.doubleValue / 1000.0)
-        }
-        if let t = obj["title"] as? String { overlay.gitTitle = t }
-        if let r = obj["repository"] as? String { overlay.gitRepo = r }
-        if let br = obj["branch"] as? String { overlay.gitBranch = br }
-        if let c = obj["commit"] as? String { overlay.gitCommit = c }
-        if let wt = obj["working_tree"] as? String { overlay.gitTree = wt }
-        if let showGit = obj["show_git"] as? Bool, showGit {
-            overlay.gitUntil = Date().addingTimeInterval(60)
-        }
-        if let showCard = obj["show_card"] as? Bool, showCard {
-            overlay.cardUntil = Date().addingTimeInterval(60)
-        }
-        if let lost = obj["target_lost"] as? Bool { overlay.targetLost = lost }
-    }
-    guard let src = NSImage(contentsOf: URL(fileURLWithPath: input)) else {
-        fputs("stamp: cannot read \(input)\n", stderr)
-        exit(1)
-    }
-    var rect = NSRect(origin: .zero, size: src.size)
-    guard let cg = src.cgImage(forProposedRect: &rect, context: nil, hints: nil) else {
-        fputs("stamp: no cgImage\n", stderr)
-        exit(1)
-    }
-    let w = cg.width
-    let h = cg.height
-    guard let colorSpace = cg.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB),
-          let ctx = CGContext(
-            data: nil,
-            width: w,
-            height: h,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-          )
-    else {
-        fputs("stamp: no context\n", stderr)
-        exit(1)
-    }
-    ctx.translateBy(x: 0, y: CGFloat(h))
-    ctx.scaleBy(x: 1, y: -1)
-    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
-    let ns = NSGraphicsContext(cgContext: ctx, flipped: true)
-    NSGraphicsContext.saveGraphicsState()
-    NSGraphicsContext.current = ns
-    drawOverlay(size: NSSize(width: w, height: h), state: overlay.snapshot())
-    NSGraphicsContext.restoreGraphicsState()
-    guard let outImg = ctx.makeImage() else {
-        fputs("stamp: makeImage failed\n", stderr)
-        exit(1)
-    }
-    let dest = URL(fileURLWithPath: output)
-    let rep = NSBitmapImageRep(cgImage: outImg)
-    guard let png = rep.representation(using: .png, properties: [:]) else {
-        fputs("stamp: png encode failed\n", stderr)
-        exit(1)
-    }
-    do {
-        try png.write(to: dest)
-    } catch {
-        fputs("stamp: write \(error.localizedDescription)\n", stderr)
-        exit(1)
-    }
-}
-
-if CommandLine.arguments.count < 2 {
-    fputs("usage: rec-capture start --output FILE [--run-id ID] [--window-id N | --display main]\n", stderr)
-    fputs("       rec-capture list-windows | list-displays | stamp --input PNG --output PNG --state JSON\n", stderr)
-    exit(1)
-}
-
-let args = parseArgs()
-switch args.command {
-case "list-windows":
-    do { try listWindows() } catch {
-        emit(["event": "error", "message": error.localizedDescription])
-        fputs(error.localizedDescription + "\n", stderr)
-        exit(1)
-    }
-    exit(0)
-case "list-displays":
-    do { try listDisplays() } catch {
-        emit(["event": "error", "message": error.localizedDescription])
-        fputs(error.localizedDescription + "\n", stderr)
-        exit(1)
-    }
-    exit(0)
-case "stamp":
-    guard let input = args.input, let output = args.output else {
-        fputs("stamp requires --input and --output\n", stderr)
-        exit(1)
-    }
-    stampFrame(input: input, output: output, statePath: args.state, runId: args.runId)
-    exit(0)
-case "start":
-    break
-default:
-    fputs("usage: rec-capture start --output FILE [--run-id ID] [--window-id N | --display main]\n", stderr)
-    fputs("       rec-capture list-windows | list-displays | stamp --input PNG --output PNG --state JSON\n", stderr)
-    exit(1)
-}
-
-guard let output = args.output else {
-    fputs("--output is required\n", stderr)
-    exit(1)
-}
-
-let overlay = OverlayState()
-overlay.runId = args.runId
-let session = CaptureSession(outputURL: URL(fileURLWithPath: output), overlay: overlay)
-
-do {
-    try session.start(windowId: args.windowId, display: args.display)
-} catch {
-    emit(["event": "error", "message": error.localizedDescription])
-    fputs(error.localizedDescription + "\n", stderr)
-    exit(1)
-}
-
-DispatchQueue.global(qos: .userInitiated).async {
-    while let line = readLine(strippingNewline: true) {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { continue }
-        guard let data = trimmed.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { continue }
-        let cmd = obj["cmd"] as? String ?? ""
-        if cmd == "stop" {
-            DispatchQueue.main.async {
-                session.stop {
-                    exit(0)
+    func stop() {
+        queue.async { [self] in
+            guard !stopping else { return }
+            render(); stopping = true; timer?.cancel(); timer = nil
+            let complete: (Error?) -> Void = { error in
+                if let error { emit(["event": "error", "message": error.localizedDescription]); exit(1) }
+                emit(["event": "stopped", "path": self.url.path]); exit(0)
+            }
+            let finish = {
+                self.queue.async {
+                    if let failure = self.failure { complete(failure); return }
+                    guard let writer = self.writer else { complete(RecorderError("writer missing")); return }
+                    let now = CMClockGetTime(CMClockGetHostTimeClock())
+                    let minimum = CMTimeAdd(writer.lastVideoPTS ?? now, CMTime(value: 1, timescale: 30))
+                    writer.finish(at: CMTimeCompare(now, minimum) > 0 ? now : minimum, completion: complete)
                 }
             }
-            return
+            if let stream { stream.stopCapture { _ in finish() } } else { finish() }
         }
-        overlay.apply(json: obj)
-        if let run = obj["run_id"] as? String { overlay.runId = run }
-    }
-    DispatchQueue.main.async {
-        session.stop { exit(0) }
     }
 }
 
-RunLoop.main.run()
+func stampFrame(_ args: Args) throws {
+    guard let input = args.input, let output = args.output, let path = args.state else { throw RecorderError("stamp requires --input, --output and --state") }
+    let state = OverlayState(); state.runId = args.runId
+    let object = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: path)))
+    guard let object = object as? [String: Any] else { throw RecorderError("invalid overlay state") }
+    state.loadSnapshot(object)
+    guard let source = NSImage(contentsOfFile: input) else { throw RecorderError("cannot read input image") }
+    var rect = NSRect(origin: .zero, size: source.size)
+    guard let cg = source.cgImage(forProposedRect: &rect, context: nil, hints: nil),
+          let context = CGContext(data: nil, width: cg.width, height: cg.height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { throw RecorderError("cannot create image context") }
+    context.translateBy(x: 0, y: CGFloat(cg.height)); context.scaleBy(x: 1, y: -1)
+    context.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+    NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+    drawOverlay(size: NSSize(width: cg.width, height: cg.height), state: state.snapshot())
+    NSGraphicsContext.restoreGraphicsState()
+    guard let image = context.makeImage(), let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else { throw RecorderError("PNG encoding failed") }
+    try png.write(to: URL(fileURLWithPath: output))
+}
+
+func main() throws {
+    guard CommandLine.arguments.count > 1 else { throw RecorderError("usage: rec-capture start --output FILE [--app NAME|BUNDLE | --window-id ID | --display main] [--system-audio]\n       rec-capture list-windows | list-apps | list-displays") }
+    let args = try Args.parse(Array(CommandLine.arguments.dropFirst()))
+    if ["list-windows", "list-apps", "list-displays"].contains(args.command) { try listContent(args.command); return }
+    if args.command == "stamp" { try stampFrame(args); return }
+    if args.command == "self-test" { try syntheticRecording(args); return }
+    guard args.command == "start", let output = args.output else { throw RecorderError("start requires --output") }
+    let state = OverlayState(); state.runId = args.runId
+    let session = CaptureSession(url: URL(fileURLWithPath: output), overlay: state)
+    try session.start(args)
+    DispatchQueue.global(qos: .userInitiated).async {
+        while let line = readLine() {
+            guard let data = line.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            if object["cmd"] as? String == "stop" { session.stop(); return }
+            state.apply(json: object)
+        }
+        session.stop()
+    }
+    RunLoop.main.run()
+}
+do { try main() } catch { emit(["event": "error", "message": error.localizedDescription]); fputs(error.localizedDescription + "\n", stderr); exit(1) }
