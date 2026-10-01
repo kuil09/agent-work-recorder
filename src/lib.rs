@@ -1,6 +1,7 @@
 pub mod cua;
 pub mod daemon;
 pub mod git;
+pub mod health;
 pub mod id;
 pub mod media;
 pub mod protocol;

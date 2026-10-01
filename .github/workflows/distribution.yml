@@ -8,7 +8,11 @@ on:
     paths:
       - 'packaging/**'
       - 'scripts/**'
-      - 'src/media.rs'
+      - 'src/**'
+      - 'macos/RecCapture/**'
+      - 'skills/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'tests/check_macos_package.py'
       - '.github/workflows/distribution.yml'
 

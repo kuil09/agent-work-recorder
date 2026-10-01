@@ -86,3 +86,37 @@ python3 tests/e2e.py
 화면은 창 단위로 좁혀도 시스템 오디오는 앱 단위로 필터링된다. 따라서 같은 앱의 다른 창에서 발생한 소리가 포함될 수 있다. 앱 단위 캡처는 현재 주 모니터에 한정하며 다른 모니터 합성과 앱 재시작 후 재연결은 제공하지 않는다.
 
 참조: [Apple — Take ScreenCaptureKit to the next level (WWDC22)](https://developer.apple.com/videos/play/wwdc2022/10155/), [FFmpeg formats — Metadata](https://ffmpeg.org/ffmpeg-formats.html#Metadata).
+
+## Live capture health acceptance (2026-10-01)
+
+Implemented in the live-capture-health branch; these checks do not retroactively
+change the published 0.1.0 DMG. `rec status --json` is the read-only polling surface.
+Target probes and helper reports run once per second. A missing source/idle sample
+older than 3 seconds is distinct from telemetry older than 3 seconds. Readiness
+validates a complete, correctly sized source buffer and successful video append,
+not semantic correctness of captured content. Dark/static pixel heuristics are
+advisory; they never establish target loss or broaden the filter.
+
+Observed on macOS 26.6.2 with a dedicated native dark/static window (audio off):
+
+- Before closing, status reported a validated first frame and available target,
+  with no target-loss intervals. The video showed the intended dark window.
+- Closing the selected window emitted target_lost and a ScreenCaptureKit error
+  at Run time 32.709 seconds. An in-Run status query returned target_available=false,
+  the error, source ages and affected intervals before stop.
+- Stop produced a valid 48.043-second H.264 MP4 at 1400 × 984, the same selected
+  window boundary. Reviewed later frames retained scoped pixels and the target-lost
+  warning. The target-lost interval was 32.709–48.043 seconds.
+- Raw video, session/events and capture-health.json were retained in the Run temp
+  directory. The per-Run diagnostic log remained in the user's logs directory.
+
+Synthetic telemetry checks additionally cover pending first frame, dark warning,
+missing frames, recovery, stream errors, read-only session/event preservation,
+and publishing validated MP4 with impairment intervals. Swift pixel tests cover
+dark/static warnings independently from target availability and source counters
+independently from encoded heartbeat copies.
+
+The original intermittent Chrome black-window failures on macOS 26.5.2 were
+not reproduced or attributed to window closure. The deterministic window-close
+case demonstrates detection/preservation, not the original failure's root cause.
+App restart, secondary displays and live audio remain separate runtime checks.

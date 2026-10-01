@@ -91,7 +91,11 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     var ready = false
     var failure: Error?
     var appPIDs: [pid_t] = []
-    var lastAppCheck = Date.distantPast
+    let health = NativeCaptureHealth()
+    var healthTimer: DispatchSourceTimer?
+    var windowID: UInt32?
+    var displayID: CGDirectDisplayID?
+    var streamError: String?
     init(url: URL, overlay: OverlayState) { self.url = url; self.overlay = overlay }
 
     func start(_ args: Args) throws {
@@ -99,12 +103,14 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         let filter: SCContentFilter
         if let id = args.windowId {
             guard let window = content.windows.first(where: { $0.windowID == id }) else { throw RecorderError("window \(id) not found") }
+            windowID = id
             filter = try CaptureEnvironment.windowFilter(window)
         } else {
             let displayID: CGDirectDisplayID
             if args.display == nil || args.display == "main" { displayID = CGMainDisplayID() }
             else if let id = UInt32(args.display ?? "") { displayID = id }
             else { throw RecorderError("invalid display ID") }
+            self.displayID = displayID
             guard let display = content.displays.first(where: { $0.displayID == displayID }) else { throw RecorderError("display not found") }
             if let query = args.app {
                 let exact = content.applications.filter { $0.bundleIdentifier == query || $0.applicationName.lowercased() == query.lowercased() }
@@ -116,6 +122,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                 filter = SCContentFilter(display: display, including: exact, exceptingWindows: [])
             } else { filter = SCContentFilter(display: display, excludingWindows: []) }
         }
+        health.targetAvailable = true
         let scale = CGFloat(filter.pointPixelScale)
         var width = max(2, Int(filter.contentRect.width * scale))
         var height = max(2, Int(filter.contentRect.height * scale))
@@ -139,6 +146,16 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         stream.startCapture { error in startError = error; done.signal() }
         guard done.wait(timeout: .now() + 8) == .success else { throw RecorderError("startCapture timed out") }
         if let startError { throw CaptureEnvironment.classify(startError) }
+        queue.async { [self] in
+            checkTarget()
+            let healthTimer = DispatchSource.makeTimerSource(queue: queue)
+            healthTimer.schedule(deadline: .now() + 1, repeating: 1)
+            healthTimer.setEventHandler { [weak self] in
+                guard let self, !self.stopping else { return }
+                self.checkTarget(); self.reportHealth()
+            }
+            self.healthTimer = healthTimer; healthTimer.resume()
+        }
         emit(["event": "started", "width": width, "height": height, "system_audio": args.systemAudio])
     }
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -147,8 +164,15 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
             switch type {
             case .screen:
                 if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
-                   let status = attachments.first?[.status] as? Int, status != SCFrameStatus.complete.rawValue { return }
+                   let status = attachments.first?[.status] as? Int, status != SCFrameStatus.complete.rawValue {
+                    if status == SCFrameStatus.idle.rawValue { health.idle() }
+                    return
+                }
                 guard let pixel = sampleBuffer.imageBuffer else { return }
+                guard let writer, CVPixelBufferGetWidth(pixel) == writer.width, CVPixelBufferGetHeight(pixel) == writer.height else {
+                    throw RecorderError("source frame dimensions do not match the requested capture")
+                }
+                health.sourceFrame(pixel)
                 lastBuffer = pixel
                 if timer == nil {
                     render()
@@ -164,41 +188,66 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     }
     func render() {
         guard !stopping, failure == nil, let pixel = lastBuffer, let writer else { return }
-        if !appPIDs.isEmpty && Date().timeIntervalSince(lastAppCheck) >= 1 {
-            lastAppCheck = Date()
-            if appPIDs.allSatisfy({ NSRunningApplication(processIdentifier: $0)?.isTerminated ?? true }) { overlay.apply(json: ["cmd": "target_lost"]) }
-        }
         do {
             let now = CMClockGetTime(CMClockGetHostTimeClock())
             if try writer.appendVideo(pixel, at: now), !ready, let origin = writer.origin {
                 ready = true
                 CaptureWorkerLifetime.markReady()
                 let elapsed = max(0, CMTimeGetSeconds(CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), origin)) * 1000)
+                reportHealth()
                 emit(["event": "ready", "elapsed_ms": Int(elapsed)])
             }
         } catch { fail(error) }
     }
+    func mediaElapsed() -> Int {
+        guard let origin = writer?.origin else { return 0 }
+        return Int(max(0, CMTimeGetSeconds(CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), origin))) * 1000)
+    }
+    func reportHealth() {
+        let origin = writer?.origin.map { CMTimeGetSeconds($0) }
+        emit(["event": "health", "elapsed_ms": mediaElapsed(), "health": health.snapshot(written: writer?.videoFrames ?? 0, validated: ready, origin: origin)])
+    }
+    func checkTarget() {
+        let available: Bool?
+        if let windowID {
+            if let windows = CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as? [[String: Any]] {
+                available = windows.contains { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == windowID }
+            } else { available = nil }
+        } else if !appPIDs.isEmpty {
+            available = appPIDs.contains { !(NSRunningApplication(processIdentifier: $0)?.isTerminated ?? true) }
+        } else if let displayID { available = CGDisplayIsActive(displayID) != 0 }
+        else { available = nil }
+        if available == false && health.targetAvailable != false {
+            overlay.apply(json: ["cmd": "target_lost"])
+            emit(["event": "target_lost", "elapsed_ms": mediaElapsed(), "message": "The selected capture target no longer exists; scope is unchanged."])
+        }
+        health.targetAvailable = available
+    }
     func fail(_ error: Error) {
-        if failure == nil { failure = error; emit(["event": "error", "message": error.localizedDescription]) }
+        if failure == nil {
+            failure = error; health.captureError = error.localizedDescription
+            emit(["event": "error", "elapsed_ms": mediaElapsed(), "message": error.localizedDescription]); reportHealth()
+        }
     }
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         queue.async { [self] in
-            overlay.apply(json: ["cmd": "target_lost"])
-            emit(["event": "target_lost", "message": error.localizedDescription])
-            // Heartbeat keeps the last scoped frame and a visible target-lost warning.
+            streamError = error.localizedDescription; health.captureError = streamError
+            checkTarget()
+            emit(["event": "error", "elapsed_ms": mediaElapsed(), "message": error.localizedDescription])
+            reportHealth()
+            // Preserve scoped cached pixels and finalize the writer on explicit stop.
         }
     }
     func stop() {
         queue.async { [self] in
             guard !stopping else { return }
-            render(); stopping = true; timer?.cancel(); timer = nil
+            render(); checkTarget(); reportHealth(); stopping = true; timer?.cancel(); timer = nil; healthTimer?.cancel(); healthTimer = nil
             let complete: (Error?) -> Void = { error in
                 if let error { emit(["event": "error", "message": error.localizedDescription]); exit(1) }
                 emit(["event": "stopped", "path": self.url.path]); exit(0)
             }
             let finish = {
                 self.queue.async {
-                    if let failure = self.failure { complete(failure); return }
                     guard let writer = self.writer else { complete(RecorderError("writer missing")); return }
                     let now = CMClockGetTime(CMClockGetHostTimeClock())
                     let minimum = CMTimeAdd(writer.lastVideoPTS ?? now, CMTime(value: 1, timescale: 30))

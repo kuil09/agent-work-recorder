@@ -1,4 +1,5 @@
 use crate::git::GitInfo;
+use crate::health::{CaptureHealth, HealthTracker};
 use crate::id::{format_step_id, write_json_atomic};
 use crate::protocol::{
     CaptureHud, EventKind, IpcRequest, IpcResponse, ObserveStatus, RunEvent, TestResult,
@@ -257,18 +258,51 @@ struct CaptureEvent {
     message: Option<String>,
     #[serde(default)]
     elapsed_ms: u64,
+    health: Option<CaptureHealth>,
 }
 struct CaptureProc {
     child: Child,
     stdin: ChildStdin,
     failure: Arc<Mutex<Option<String>>>,
     stopped: bool,
+    telemetry: Arc<Mutex<HealthTracker>>,
+    started: Instant,
 }
 enum CaptureBackend {
     Sck(CaptureProc),
     Cua(crate::cua::CuaGrabber),
 }
 impl CaptureBackend {
+    fn snapshot(&mut self) -> CaptureHealth {
+        match self {
+            Self::Sck(p) => {
+                let now = Instant::now();
+                let elapsed = p.started.elapsed().as_millis() as u64;
+                if !p.stopped {
+                    match p.child.try_wait() {
+                        Ok(Some(status)) => p.telemetry.lock().unwrap().error(
+                            format!("capture process exited: {status}"),
+                            now,
+                            elapsed,
+                        ),
+                        Err(error) => {
+                            p.telemetry
+                                .lock()
+                                .unwrap()
+                                .error(error.to_string(), now, elapsed)
+                        }
+                        _ => {}
+                    }
+                }
+                p.telemetry.lock().unwrap().snapshot(now, elapsed)
+            }
+            Self::Cua(_) => CaptureHealth {
+                state: "unverified".into(),
+                first_frame: "unverified (screenshot fallback)".into(),
+                ..Default::default()
+            },
+        }
+    }
     fn health(&mut self) -> Result<()> {
         if let Self::Sck(p) = self {
             if let Some(error) = p.failure.lock().unwrap().clone() {
@@ -333,6 +367,16 @@ impl CaptureBackend {
         }
     }
 }
+fn diagnostic_log(run_id: &str) -> String {
+    session::session_dir()
+        .map(|d| {
+            d.join("logs")
+                .join(format!("{run_id}.log"))
+                .display()
+                .to_string()
+        })
+        .unwrap_or_default()
+}
 fn hud_update(s: &RunState) -> CaptureHud {
     CaptureHud {
         cmd: "hud".into(),
@@ -381,19 +425,35 @@ fn spawn_capture(bin: &Path, raw: &Path, args: &DaemonArgs) -> Result<(CapturePr
     let stdout = child.stdout.take().context("capture stdout")?;
     let failure = Arc::new(Mutex::new(None));
     let errors = failure.clone();
+    let telemetry = Arc::new(Mutex::new(HealthTracker::default()));
+    let updates = telemetry.clone();
+    let spawned = Instant::now();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             eprintln!("capture: {line}");
             if let Ok(ev) = serde_json::from_str::<CaptureEvent>(&line) {
+                let now = Instant::now();
+                let elapsed = if ev.elapsed_ms > 0 {
+                    ev.elapsed_ms
+                } else {
+                    spawned.elapsed().as_millis() as u64
+                };
+                if let Some(health) = ev.health {
+                    updates.lock().unwrap().update(health, now, elapsed);
+                }
+                if ev.event == "target_lost" {
+                    updates.lock().unwrap().target_lost(elapsed);
+                }
                 if ev.event == "ready" {
                     let _ = tx.send((ev.elapsed_ms, Instant::now()));
                 }
                 if ev.event == "error" || ev.event == "permission-denied" {
-                    *errors.lock().unwrap() = Some(
-                        ev.message
-                            .unwrap_or_else(|| "Screen Recording permission is required".into()),
-                    );
+                    let message = ev
+                        .message
+                        .unwrap_or_else(|| "Screen Recording permission is required".into());
+                    updates.lock().unwrap().error(message.clone(), now, elapsed);
+                    *errors.lock().unwrap() = Some(message);
                 }
             }
         }
@@ -410,6 +470,8 @@ fn spawn_capture(bin: &Path, raw: &Path, args: &DaemonArgs) -> Result<(CapturePr
                     stdin,
                     failure,
                     stopped: false,
+                    telemetry,
+                    started: start,
                 },
                 start,
             ));
@@ -442,7 +504,6 @@ fn record(
         !state.finalizing,
         "recording is finalizing; retry rec stop instead of adding events"
     );
-    capture.health()?;
     let mut event = state.next_step(kind, text, status);
     event.test_result = result;
     let mut f = OpenOptions::new()
@@ -451,14 +512,22 @@ fn record(
         .open(state.tmp_dir.join("events.jsonl"))?;
     serde_json::to_writer(&mut f, &event)?;
     f.write_all(b"\n")?;
-    capture.send(&hud_update(state))?;
-    capture.send(&CaptureHud {
-        cmd: "card".into(),
-        step: Some(event.step),
-        kind: Some(kind.as_card_title().into()),
-        body: Some(event.text.clone()),
-        ..Default::default()
-    })?;
+    let delivery = (|| -> Result<()> {
+        capture.send(&hud_update(state))?;
+        capture.send(&CaptureHud {
+            cmd: "card".into(),
+            step: Some(event.step),
+            kind: Some(kind.as_card_title().into()),
+            body: Some(event.text.clone()),
+            ..Default::default()
+        })
+    })();
+    if let Err(error) = delivery {
+        // Preserve the event and allow a failed/abandoned test to reach finalization.
+        state.add_warning(format!(
+            "annotation saved to diagnostics but capture delivery failed: {error:#}"
+        ));
+    }
     state.hold_until = Instant::now() + Duration::from_secs(4);
     state.events.push(event);
     let mut response = state.response();
@@ -484,10 +553,21 @@ fn finish(
         }
         state.finalizing = true;
     }
-    capture.stop()?;
+    let capture_result = capture.stop();
+    let mut health = capture.snapshot();
+    if let Err(error) = &capture_result {
+        state.add_warning(format!(
+            "capture finalization reported {error:#}; attempting to preserve validated MP4"
+        ));
+    }
     let info = crate::media::probe(raw)?;
     crate::media::validate(&info, audio)?;
     let duration = crate::media::duration_ms(&info)?;
+    for interval in &mut health.intervals {
+        if interval.end_ms.is_none() {
+            interval.end_ms = Some(duration.max(interval.start_ms));
+        }
+    }
     let chapters = crate::media::chapters(&state.events, duration);
     let meta = state.tmp_dir.join("chapters.ffmetadata");
     fs::write(
@@ -514,15 +594,37 @@ fn finish(
         state.output = published;
     }
     crate::media::remux(raw, &state.output, &meta, &chapters, audio, &state.run_id)?;
+    let impaired =
+        !health.intervals.is_empty() || health.capture_error.is_some() || capture_result.is_err();
+    if health.state == "unverified" {
+        state.add_warning(
+            "capture telemetry unavailable or first frame unverified; inspect the MP4".into(),
+        );
+    }
+    if impaired {
+        state.add_warning(format!(
+            "capture was impaired; inspect intervals and retained diagnostics: {}",
+            state.tmp_dir.display()
+        ));
+        if let Err(error) = write_json_atomic(&state.tmp_dir.join("capture-health.json"), &health) {
+            state.add_warning(format!("could not save capture health summary: {error}"));
+        }
+    }
     // The MP4 is published from here on: cleanup problems are warnings, never a failed stop,
     // because a retry could not find the raw capture any more.
-    if let Err(error) = fs::remove_dir_all(&state.tmp_dir) {
+    if let Err(error) = if impaired {
+        Ok(())
+    } else {
+        fs::remove_dir_all(&state.tmp_dir)
+    } {
         state.add_warning(format!(
             "MP4 published, but temporary files were not fully removed ({error}): {}",
             state.tmp_dir.display()
         ));
     }
     let mut reply = state.response();
+    reply.capture_health = Some(health);
+    reply.diagnostic_log = Some(diagnostic_log(&state.run_id));
     reply.duration = Some(format!(
         "{:02}:{:02}",
         duration / 60000,
@@ -613,8 +715,9 @@ fn handle(
             record(state, capture, EventKind::Checkpoint, text, None, None)
         }
         IpcRequest::Status => {
-            capture.health()?;
             let mut reply = state.response();
+            reply.capture_health = Some(capture.snapshot());
+            reply.diagnostic_log = Some(diagnostic_log(&state.run_id));
             reply.active_test = state.active_test.as_ref().map(|t| t.command.clone());
             Ok(reply)
         }
@@ -821,6 +924,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         let (request, mut output) = match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(message) => message,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = capture.snapshot();
                 // Also resolve an overdue test while nobody is sending commands.
                 if let Err(error) = reap_test(&mut state, &mut capture) {
                     eprintln!("could not close an overdue test: {error:#}");
@@ -832,7 +936,9 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         let mut stopped = false;
         let response = match request {
             Ok(req) => (|| -> Result<IpcResponse> {
-                reap_test(&mut state, &mut capture)?;
+                if !matches!(req, IpcRequest::Status) {
+                    reap_test(&mut state, &mut capture)?;
+                }
                 if let IpcRequest::Stop { abandon_test } = req {
                     if abandon_test {
                         end_test_without_result(
@@ -851,6 +957,9 @@ pub fn run(args: DaemonArgs) -> Result<()> {
             Err(e) => Err(anyhow::anyhow!(e)),
         };
         let response = response.unwrap_or_else(|e| IpcResponse::err(format!("{e:#}")));
+        let mut response = response;
+        response.capture_target = Some(args.capture.describe());
+        response.diagnostic_log = Some(diagnostic_log(&state.run_id));
         let _ = writeln!(output, "{}", serde_json::to_string(&response)?);
         if stopped {
             if let Err(error) = session::clear_session() {

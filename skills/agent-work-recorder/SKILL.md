@@ -56,6 +56,16 @@ broaden an active recording. Browser automation that sets files directly may byp
 the native dialog entirely; disclose that route and record the resulting UI state
 instead of claiming the video shows a native selection interaction.
 
+During a Run, poll `rec status --json` after important transitions and periodically
+(e.g. once per second) during long workflows. This is read-only and creates no Step.
+Check `capture_health.first_frame`, `target_available`, source frame/sample ages,
+`capture_error`, and `intervals`. Encoded frame copies do not establish source delivery.
+`visual_warning` for dark/static pixels is advisory, never proof of target loss.
+`unverified`/pending telemetry must not be described as healthy capture. Report
+lost targets, missing frames, or stale telemetry promptly; retain the exact scope
+and use explicit stop to preserve the Run. Include stop intervals and diagnostic
+paths in the final evidence summary, even if an MP4 was successfully published.
+
 Leave audio OFF unless the task authorizes `--system-audio`. A single-window video's
 optional audio is **owning-app audio**, so sound from the same app's other windows can
 be included. No microphone capture is configured. App capture is main-display only;

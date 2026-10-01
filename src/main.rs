@@ -58,7 +58,11 @@ enum Commands {
     },
     /// Show the active Run without changing it
     #[command(long_about = help::STATUS, after_long_help = help::STATUS_DETAILS)]
-    Status,
+    Status {
+        /// Emit a machine-readable read-only response
+        #[arg(long)]
+        json: bool,
+    },
     /// Record current action/context
     #[command(long_about = help::NOTE, after_long_help = help::NOTE_DETAILS)]
     Note {
@@ -181,8 +185,12 @@ fn send_to(session: &SessionFile, req: IpcRequest) -> Result<IpcResponse> {
     let resp: IpcResponse = serde_json::from_str(&reply).context("invalid daemon response")?;
     ensure!(
         resp.ok,
-        "{}",
-        resp.error.as_deref().unwrap_or("request failed")
+        "{}{}",
+        resp.error.as_deref().unwrap_or("request failed"),
+        resp.diagnostic_log
+            .as_ref()
+            .map(|p| format!("; diagnostics: {p}"))
+            .unwrap_or_default()
     );
     Ok(resp)
 }
@@ -195,6 +203,48 @@ fn print_resp(resp: &IpcResponse) {
     }
     if let Some(verdict) = &resp.verdict {
         println!("{verdict}");
+    }
+    if let Some(warning) = &resp.warning {
+        println!("Warning: {warning}");
+    }
+}
+fn print_capture_health(r: &IpcResponse) {
+    if let Some(target) = &r.capture_target {
+        println!("Target     {target}");
+    }
+    if let Some(h) = &r.capture_health {
+        println!("Capture    {}\nFirst frame {}\nTarget available {}\nSource frames {}\nEncoded frames {}", h.state, h.first_frame, h.target_available.map(|v| v.to_string()).unwrap_or_else(|| "unknown".into()), h.frames_received, h.frames_written);
+        println!(
+            "Last source frame (Run ms) {} | age ms {} | sample age ms {}",
+            h.last_frame_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            h.last_frame_age_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            h.last_sample_age_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        );
+        if let Some(e) = &h.capture_error {
+            println!("Capture error: {e}");
+        }
+        if let Some(w) = &h.visual_warning {
+            println!("Visual warning: {w} (not proof of target loss)");
+        }
+        for i in &h.intervals {
+            println!(
+                "Capture interval: {} from {:.3}s to {}",
+                i.reason,
+                i.start_ms as f64 / 1000.0,
+                i.end_ms
+                    .map(|v| format!("{:.3}s", v as f64 / 1000.0))
+                    .unwrap_or_else(|| "end of Run / ongoing".into())
+            );
+        }
+    }
+    if let Some(path) = &r.diagnostic_log {
+        println!("Diagnostics {path}");
     }
 }
 fn log_tail(path: &std::path::Path) -> String {
@@ -219,9 +269,16 @@ fn start_run(
     let mut reserved = None;
     let result = start_run_inner(title, capture, output, no_git_context, &mut reserved);
     if result.is_err() {
-        // A Run that never became active must not leave its args/temp directory behind.
+        // Remove unused startup files, but retain any raw capture for diagnosis.
         if let Some(dir) = reserved {
-            let _ = fs::remove_dir_all(dir);
+            if !dir.join("raw.mp4").exists() {
+                let _ = fs::remove_dir_all(dir);
+            } else {
+                eprintln!(
+                    "Incomplete raw capture and startup evidence retained: {}",
+                    dir.display()
+                );
+            }
         }
     }
     result
@@ -345,12 +402,15 @@ fn start_run_inner(
                     println!("Git: unavailable");
                 }
                 println!("Output     {}", session.output);
+                let health = send_to(&session, IpcRequest::Status)?;
+                print_capture_health(&health);
                 return Ok(());
             }
         }
         if let Some(status) = child.try_wait()? {
             bail!(
-                "recorder daemon exited during startup ({status})\n{}",
+                "recorder daemon exited during startup ({status}); diagnostics: {}\n{}",
+                log_path.display(),
                 log_tail(&log_path)
             );
         }
@@ -409,8 +469,13 @@ fn run() -> Result<i32> {
             output,
             no_git_context,
         } => start_run(title, capture, output, no_git_context)?,
-        Commands::Status => {
+        Commands::Status { json } => {
             let r = send_ipc(IpcRequest::Status)?;
+            if json {
+                println!("{}", serde_json::to_string(&r)?);
+                return Ok(0);
+            }
+            print_capture_health(&r);
             println!(
                 "Run        {}\nDuration   {}\nSteps      {}\nCheckpoints {}\nTests      {}\nOutput     {}",
                 r.run_id.unwrap_or_default(),
@@ -450,6 +515,7 @@ fn run() -> Result<i32> {
         } => return test_run(command, timeout_secs, no_output_summary),
         Commands::Stop { abandon_test } => {
             let r = send_ipc(IpcRequest::Stop { abandon_test })?;
+            print_capture_health(&r);
             println!("Recording complete\n\nDuration   {}\nSteps      {}\nCheckpoints {}\nTests      {}\n\n{}", r.duration.unwrap_or_default(), r.steps.unwrap_or(0), r.checkpoints.unwrap_or(0), r.tests.unwrap_or(0), r.output.unwrap_or_default());
             if let Some(warning) = r.warning {
                 println!("\nWarning: {warning}");
