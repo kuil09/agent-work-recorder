@@ -36,7 +36,7 @@ Apple Silicon Mac의 macOS 14 이상을 지원한다. 일반 사용자용 **DMG�
 
 에이전트가 셸 설정을 읽지 않는 실행 환경에서는 `/Applications/Agent Work Recorder.app/Contents/Resources/bin/rec`를 직접 사용한다. 에이전트용 스킬도 앱의 `Contents/Resources/agent-work-recorder/`에 포함된다.
 
-공개 다운로드 게시 전에는 패키지를 빌드한 사람이 DMG를 전달해야 한다. `DEVELOPMENT-NOT-NOTARIZED` 파일은 개발 검증용이며 일반 사용자용 공증 배포 파일과 구분한다. 빌드·서명·공증·CI 절차는 [macOS 배포 문서](docs/macos-distribution.md)를 참고한다.
+일반 사용자용 공증 DMG는 [GitHub Releases](https://github.com/kuil09/agent-work-recorder/releases/latest)에서 다운로드한다. `DEVELOPMENT-NOT-NOTARIZED` 파일은 개발 검증용이며 일반 사용자용 공증 배포 파일과 구분한다. 빌드·서명·공증·CI 절차는 [macOS 배포 문서](docs/macos-distribution.md)를 참고한다.
 
 개발자가 소스에서 설치하려면 Rust stable, Swift 5.9 이상, macOS SDK, `make`, `ffmpeg`·`ffprobe`를 준비한 뒤 `make install`을 실행한다. 기본 설치 위치는 `~/.local/bin`이며 `make install PREFIX=/your/prefix`로 변경할 수 있다.
 

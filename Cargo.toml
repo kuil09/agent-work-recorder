@@ -1,6 +1,6 @@
 [package]
 name = "rec"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Agent Work Recorder — macOS CLI screen recorder for coding agents"
 license = "MIT"
