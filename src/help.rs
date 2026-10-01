@@ -217,9 +217,10 @@ SHARING
   Give the human the final MP4 and relevant Run:Step references. Ask for a screenshot
   with the identifier visible plus feedback text. Never auto-upload without permission."#;
 
-pub const STATUS: &str = "Show the active Run's counters, output path and any running test; changes nothing.\n\nRead-only: creates no Step, card or chapter and does not touch the session files. Use it\nto confirm which Run you are talking to and whether a test is still marked active.";
+pub const STATUS: &str = "Show the active Run's live capture health, counters, output path and running test; changes nothing.\n\nRead-only: creates no Step, card or chapter and does not touch the session files. Use it\nto confirm which Run you are talking to and whether a test is still marked active.";
 pub const STATUS_DETAILS: &str = r#"EXAMPLE
   rec status
+  rec status --json
 
 OUTPUT
   Run, elapsed duration, Step/Checkpoint/Test counts, the planned output path and the
@@ -229,4 +230,14 @@ OUTPUT
 ERRORS
   No active recording: nothing to report. An error saying the Run cannot be verified
   means this process is restricted: use the same authorized host context as rec start.
-  Status never stops, cancels or repairs a Run."#;
+  Status never stops, cancels or repairs a Run.
+
+CAPTURE HEALTH
+  First frame validation checks a complete source buffer and successful encoding,
+  not whether the app content is correct. Target existence is checked every second.
+  Health arrives every second; over 3 seconds without source/idle samples or health
+  is reported separately. Encoded heartbeat copies do not count as source frames.
+  Dark/static pixels are warnings, never proof of target loss. Target loss and capture
+  errors preserve scope and remain visible in the stop intervals and diagnostic log.
+  Older helpers without telemetry are unverified, never reported as receiving.
+  --json emits the same read-only response for polling from an agent."#;

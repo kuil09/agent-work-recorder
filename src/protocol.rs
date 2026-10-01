@@ -184,6 +184,9 @@ pub struct IpcResponse {
     pub warning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_test: Option<String>,
+    pub capture_health: Option<crate::health::CaptureHealth>,
+    pub capture_target: Option<String>,
+    pub diagnostic_log: Option<String>,
 }
 impl IpcResponse {
     pub fn err(msg: impl Into<String>) -> Self {

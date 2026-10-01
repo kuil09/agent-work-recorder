@@ -18,6 +18,7 @@ test:
 	swift test --package-path macos/RecCapture
 	cargo build
 	python3 tests/e2e.py
+	python3 tests/check_capture_health.py
 	python3 tests/check_session_liveness.py
 
 install: all
