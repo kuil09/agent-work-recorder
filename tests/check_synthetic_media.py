@@ -41,8 +41,8 @@ def main():
 
         top = bright_pixels(0, 70)
         bottom = bright_pixels(height - 70, height)
-        assert top > 100, f'{name}: Run/Step text is missing from the top region ({top} bright pixels)'
-        assert bottom < 10, f'{name}: overlay incorrectly appears at the bottom ({bottom} bright pixels)'
+        assert top < 10, f'{name}: overlay incorrectly appears at the top ({top} bright pixels)'
+        assert bottom > 100, f'{name}: Run/Step text is missing from the bottom region ({bottom} bright pixels)'
         center = (height // 2 * width + width // 2) * 3
         assert all(65 <= value <= 95 for value in pixels[center:center + 3]), 'source background changed unexpectedly'
         subprocess.run(['ffmpeg', '-nostdin', '-y', '-v', 'error', '-i', str(path), '-frames:v', '1', str(directory / (path.stem + '.png'))], check=True)
@@ -59,7 +59,7 @@ def main():
             result['decoded_audio_rms'] = round(rms, 2)
         report.append(result)
     (directory / 'native-pixel-audio-report.json').write_text(json.dumps(report, indent=2))
-    print('Native H.264/AAC duration, non-silent audio and top-left overlay pixel checks passed.')
+    print('Native H.264/AAC duration, non-silent audio and bottom overlay pixel checks passed.')
 
 
 if __name__ == '__main__':
