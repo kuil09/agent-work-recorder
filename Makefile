@@ -1,7 +1,7 @@
 PREFIX ?= $(HOME)/.local
 BIN := $(PREFIX)/bin
 
-.PHONY: all rec rec-capture test install clean
+.PHONY: all rec rec-capture test install package release-package clean
 
 all: rec rec-capture
 
@@ -26,6 +26,12 @@ install: all
 	cp macos/RecCapture/.build/release/rec-capture $(BIN)/rec-capture
 	chmod 755 $(BIN)/rec $(BIN)/rec-capture
 	@echo installed $(BIN)/rec $(BIN)/rec-capture
+
+package:
+	bash scripts/package-macos.sh development
+
+release-package:
+	bash scripts/package-macos.sh release
 
 clean:
 	cargo clean

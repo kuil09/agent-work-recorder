@@ -83,13 +83,14 @@ func wrapped(_ text: String, font: NSFont, width: CGFloat, limit: Int) -> [Strin
 }
 
 func drawOverlay(size: NSSize, state: OverlayState) {
-    let scale = min(1.0, max(0.55, min(size.width / 900, size.height / 500)))
-    let pad = 12 * scale
-    let idFont = NSFont.monospacedSystemFont(ofSize: 24 * scale, weight: .bold)
-    let bodyFont = NSFont.systemFont(ofSize: 17 * scale, weight: .medium)
-    let metaFont = NSFont.monospacedSystemFont(ofSize: 14 * scale, weight: .regular)
-    let lineH = 24 * scale
-    let width = max(20, size.width - pad * 2)
+    // Scale with the encoded frame so Retina captures remain readable on playback.
+    let scale = max(0.5, min(size.width / 1280, size.height / 720))
+    let pad = 16 * scale
+    let idFont = NSFont.monospacedSystemFont(ofSize: 32 * scale, weight: .bold)
+    let bodyFont = NSFont.systemFont(ofSize: 26 * scale, weight: .medium)
+    let metaFont = NSFont.monospacedSystemFont(ofSize: 22 * scale, weight: .medium)
+    let lineH = 40 * scale
+    let width = max(1, size.width - pad * 2)
     let now = Date()
     var body: [String] = []
     if let verdict = state.verdict { body.append(verdict) }
@@ -105,11 +106,22 @@ func drawOverlay(size: NSSize, state: OverlayState) {
             context = wrapped("Git: \(repo) | \(state.gitBranch ?? "-") | \(state.gitCommit ?? "-") | \(state.gitTree ?? "-")", font: metaFont, width: width, limit: 2)
         } else { context = ["Git: unavailable"] }
     }
-    if state.targetLost { body.insert("CAPTURE TARGET LOST — last frame retained", at: 0) }
+    if state.targetLost {
+        body.insert(contentsOf: wrapped("CAPTURE TARGET LOST — last frame retained", font: bodyFont, width: width, limit: 2), at: 0)
+    }
+    // Bound the panel and truncate complete rows instead of drawing off-frame.
+    let rowBudget = max(1, Int((size.height * 0.5 - pad * 2) / lineH))
+    context = Array(context.prefix(max(0, rowBudget - 1)))
+    let bodyBudget = max(0, rowBudget - 1 - context.count)
+    if body.count > bodyBudget {
+        body = Array(body.prefix(bodyBudget))
+        if !body.isEmpty { body[body.count - 1] = "…" }
+    }
     let height = min(size.height, pad * 2 + lineH * CGFloat(1 + body.count + context.count))
+    let top = size.height - height
     NSColor(white: 0.05, alpha: 0.94).setFill()
-    NSRect(x: 0, y: 0, width: size.width, height: height).fill()
-    var y = pad
+    NSRect(x: 0, y: top, width: size.width, height: height).fill()
+    var y = top + pad
     let identifier = String(format: "%@:%03u", state.runId, state.step)
     (identifier as NSString).draw(at: NSPoint(x: pad, y: y), withAttributes: [.font: idFont, .foregroundColor: NSColor.white])
     for line in body {

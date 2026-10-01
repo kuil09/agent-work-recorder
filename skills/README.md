@@ -20,6 +20,10 @@ MP4 확인, 스크린샷 피드백을 새 Run에 연결하는 절차를 포함�
 지시하거나, 사용 중인 에이전트가 설정한 **skill discovery 디렉터리**에 이 디렉터리 전체를 복사한다.
 설치 경로는 호스트마다 다르며 이 문서가 특정 호스트의 자동 검색 경로를 가정하지 않는다.
 
+DMG 설치 앱에도 같은 스킬이 포함된다. 저장소 없이 사용하는 경우
+`/Applications/Agent Work Recorder.app/Contents/Resources/agent-work-recorder/SKILL.md`를
+에이전트에게 읽도록 지시할 수 있다. 앱은 에이전트별 스킬 검색 디렉터리를 자동 변경하지 않는다.
+
 ```bash
 # 저장소 루트에서 실행. 실제 호스트의 스킬 검색 경로를 먼저 지정한다.
 # export AGENT_SKILLS_DIR='/absolute/path/to/your/agent/skills'

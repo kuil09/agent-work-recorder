@@ -14,6 +14,7 @@ pub const OVERVIEW_DETAILS: &str = r#"AGENT WORKFLOW
 PRECONDITIONS AND LIFECYCLE
   Recording requires macOS 14+, rec-capture, ffmpeg, ffprobe and Screen Recording
   permission for the terminal/agent host. Help and version need none of these.
+  The macOS app package includes these tools; source installs need media tools on PATH.
   Only one Run is active for the shared HOME session. start does not toggle recording.
   Other commands require that Run; use the same user, HOME and TMPDIR across calls.
   Do not stop, annotate or delete another task's session. Do not use daemon directly.
@@ -70,7 +71,7 @@ ON FAILURE
   An active Run: identify its owner; do not stop it merely to make start succeed.
   Permission denied: arrange permission in System Settings > Privacy & Security,
   then relaunch the terminal/agent host. Never bypass the OS permission boundary.
-  Missing tools: ensure rec-capture, ffmpeg and ffprobe are installed and on PATH.
+  Missing tools: use the complete app package; source installs need tools on PATH.
   Requested window/app/audio never falls back to full-screen or silent screenshots.
   Only full-display, video-only capture may use an available CuaDriver fallback, and
   only when you pass --allow-screenshot-fallback; otherwise the native error is shown.

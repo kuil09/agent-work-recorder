@@ -45,6 +45,17 @@ Discovery requires capture permission. IDs can change when windows reopen. Do no
 invent them or resolve ambiguity by broadening to the desktop. Choose only one target.
 Target omission records the entire main display; therefore always select one explicitly.
 
+For file uploads, downloads, or open/save dialogs, prefer app capture when the
+authorized scope includes that application's other windows. Do not assume a native
+file picker is captured merely because the page is visible. Confirm the dialog and
+the selected filename/result in the final MP4. Some dialogs belong to another
+process or display and may fall outside either an app or single-window filter.
+If the dialog is missing, mark that segment incomplete; start a new Run with an
+explicitly authorized full-display scope or another verified scope. Never silently
+broaden an active recording. Browser automation that sets files directly may bypass
+the native dialog entirely; disclose that route and record the resulting UI state
+instead of claiming the video shows a native selection interaction.
+
 Leave audio OFF unless the task authorizes `--system-audio`. A single-window video's
 optional audio is **owning-app audio**, so sound from the same app's other windows can
 be included. No microphone capture is configured. App capture is main-display only;
