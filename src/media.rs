@@ -3,7 +3,7 @@ use crate::protocol::{EventKind, RunEvent};
 use anyhow::{ensure, Context, Result};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,19 +106,35 @@ pub fn metadata(
     out
 }
 
+/// Prefer the package's private media tools without changing child-test PATH.
+fn media_tool(name: &str) -> PathBuf {
+    if let Ok(executable) = std::env::current_exe().and_then(fs::canonicalize) {
+        if let Some(directory) = executable.parent() {
+            let bundled = directory.join(name);
+            if fs::metadata(&bundled)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+            {
+                return bundled;
+            }
+        }
+    }
+    PathBuf::from(name)
+}
+
 pub fn preflight() -> Result<()> {
     for bin in ["ffmpeg", "ffprobe"] {
-        let output = Command::new(bin)
+        let output = Command::new(media_tool(bin))
             .arg("-version")
             .output()
-            .with_context(|| format!("{bin} is required on PATH"))?;
+            .with_context(|| format!("{bin} is required beside rec or on PATH"))?;
         ensure!(output.status.success(), "{bin} is not usable");
     }
     Ok(())
 }
 
 pub fn probe(path: &Path) -> Result<serde_json::Value> {
-    let output = Command::new("ffprobe")
+    let output = Command::new(media_tool("ffprobe"))
         .args([
             "-v",
             "error",
@@ -201,7 +217,7 @@ pub fn remux(
         .create_new(true)
         .open(&temp)?;
     let result = (|| -> Result<()> {
-        let mut command = Command::new("ffmpeg");
+        let mut command = Command::new(media_tool("ffmpeg"));
         command
             .args(["-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
             .arg(raw)

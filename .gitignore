@@ -2,3 +2,5 @@
 /macos/RecCapture/.build
 .DS_Store
 recordings/
+/build
+/dist

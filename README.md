@@ -25,20 +25,20 @@ CI는 빌드, 상태 모델, 실제 CLI/데몬 흐름, 합성 영상·오디오 
 
 ## 설치
 
-macOS 14 이상, Rust stable, Swift 5.9 이상과 macOS SDK, `make`, `ffmpeg`와 `ffprobe`가 필요하다. 테스트에는 Python 3도 사용한다.
+Apple Silicon Mac의 macOS 14 이상을 지원한다. 일반 사용자용 **DMG에 녹화기와 미디어 도구가 모두 포함**되므로 Homebrew, Rust, Swift 설치가 필요 없다.
 
-```bash
-# Homebrew를 사용하는 경우 미디어 도구 설치
-brew install ffmpeg
+1. Apple Silicon Mac에서 `Agent-Work-Recorder-<버전>-macos-arm64.dmg`를 연다.
+2. **Agent Work Recorder**를 **Applications** 폴더로 끌어 놓는다.
+3. 응용 프로그램 폴더의 앱을 열고 **명령 사용 설정**을 누른다.
+4. 터미널 또는 에이전트를 다시 열어 `rec --help`를 실행한다.
 
-# 저장소 루트에서 빌드·설치
-make install
-export PATH="$HOME/.local/bin:$PATH"
+설정 앱은 현재 사용자의 `~/.local/bin`에 `rec`·`rec-capture` 링크를 만들고, zsh·bash 로그인 셸의 PATH를 설정한다. 기존 명령과 `.zprofile`·`.bash_profile`은 `.rec-backup-<식별자>` 파일로 백업한다. 설정 버튼을 반복해서 눌러도 같은 설정을 중복 추가하지 않는다. 앱을 설치 후 이동하거나 삭제하면 링크가 끊기므로, 업데이트는 같은 위치의 앱을 교체한 뒤 다시 설정한다.
 
-rec --help
-```
+에이전트가 셸 설정을 읽지 않는 실행 환경에서는 `/Applications/Agent Work Recorder.app/Contents/Resources/bin/rec`를 직접 사용한다. 에이전트용 스킬도 앱의 `Contents/Resources/agent-work-recorder/`에 포함된다.
 
-기본 설치 위치는 `~/.local/bin/rec`, `~/.local/bin/rec-capture`다. 다른 위치에는 `make install PREFIX=/your/prefix`로 설치한다. `ffmpeg`와 `ffprobe`는 런타임에도 PATH에 있어야 한다.
+공개 다운로드 게시 전에는 패키지를 빌드한 사람이 DMG를 전달해야 한다. `DEVELOPMENT-NOT-NOTARIZED` 파일은 개발 검증용이며 일반 사용자용 공증 배포 파일과 구분한다. 빌드·서명·공증·CI 절차는 [macOS 배포 문서](docs/macos-distribution.md)를 참고한다.
+
+개발자가 소스에서 설치하려면 Rust stable, Swift 5.9 이상, macOS SDK, `make`, `ffmpeg`·`ffprobe`를 준비한 뒤 `make install`을 실행한다. 기본 설치 위치는 `~/.local/bin`이며 `make install PREFIX=/your/prefix`로 변경할 수 있다.
 
 화면 녹화 권한은 실행하는 터미널 또는 에이전트에 부여한다.
 
@@ -116,6 +116,8 @@ rec-capture list-displays
 ```
 
 **창 캡처**의 `--window`는 제목 또는 앱 이름의 부분 문자열로 찾는다. 결과가 여러 개이면 임의의 창을 선택하지 않고 `--window-id` 지정을 요구한다. 앱 재시작 후 자동 재연결과 여러 모니터 동시 녹화는 지원하지 않는다. 대상 소실 시에는 마지막 프레임에 `CAPTURE TARGET LOST`를 표시하고 명시적인 `rec stop`을 기다리는 경로를 사용한다.
+
+**파일 선택·저장 창의 증빙**이 필요한 작업은 허용된 범위 안에서 앱 캡처를 우선 사용한다. OS가 제공하는 창도 선택 앱 또는 선택 창에 속하면 포함될 수 있지만, 별도 프로세스나 다른 모니터의 창은 누락될 수 있다. 최종 MP4에서 창 열기 → 파일 선택 → 화면의 선택 결과까지 확인해야 한다. 창이 빠지거나 `CAPTURE TARGET LOST` 이후 화면이 정지했다면 해당 구간의 증빙은 불완전하다. 전체 화면이 필요한 경우 범위를 명시한 새 Run을 시작한다. 브라우저 자동화 API가 파일을 직접 지정하면 OS 파일 선택 창을 띄우지 않을 수 있으므로, 실제 실행 경로와 영상 누락을 구분한다.
 
 **시스템 오디오**는 `--system-audio`를 지정했을 때만 48 kHz 스테레오 AAC로 기록한다. 마이크 입력은 구성하지 않는다. 전체 화면 캡처에서는 시스템 오디오, 앱 캡처에서는 선택한 앱의 오디오가 대상이다. **한 창만 녹화해도 오디오 필터는 창이 아니라 앱 단위**이므로 같은 앱의 다른 창에서 재생되는 소리가 포함될 수 있다.
 
