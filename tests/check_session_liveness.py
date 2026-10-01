@@ -8,6 +8,7 @@ Requires cargo build, cc, ffmpeg and ffprobe. Supports Darwin and Linux test hos
 import errno
 import json
 import os
+import platform
 from pathlib import Path
 import subprocess
 import sys
@@ -74,6 +75,10 @@ def build_injector(root):
     darwin = sys.platform == 'darwin'
     library = root / ('deny-probe.dylib' if darwin else 'deny-probe.so')
     flags = ['-dynamiclib'] if darwin else ['-shared', '-fPIC']
+    if darwin and platform.machine() == 'arm64':
+        # The injected environment reaches Apple's arm64e shell/Python children
+        # as well as the arm64 Rust CLI and daemon on Apple Silicon runners.
+        flags += ['-arch', 'arm64', '-arch', 'arm64e']
     command = ['cc', *flags, '-Wall', '-Wextra', str(source), '-o', str(library)]
     if not darwin:
         command += ['-ldl']
